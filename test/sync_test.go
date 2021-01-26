@@ -265,7 +265,7 @@ func scSyncAndCompare(p []*rc.Process, expected [][]fileInfo) error {
 			return err
 		}
 		if err := compareDirectoryContents(actual, expected[0]); err != nil {
-			return fmt.Errorf("%s: %v", dir, err)
+			return fmt.Errorf("%s: %w", dir, err)
 		}
 	}
 
@@ -276,7 +276,7 @@ func scSyncAndCompare(p []*rc.Process, expected [][]fileInfo) error {
 				return err
 			}
 			if err := compareDirectoryContents(actual, expected[1]); err != nil {
-				return fmt.Errorf("%s: %v", dir, err)
+				return fmt.Errorf("%s: %w", dir, err)
 			}
 		}
 	}
@@ -288,9 +288,22 @@ func scSyncAndCompare(p []*rc.Process, expected [][]fileInfo) error {
 				return err
 			}
 			if err := compareDirectoryContents(actual, expected[2]); err != nil {
-				return fmt.Errorf("%s: %v", dir, err)
+				return fmt.Errorf("%s: %w", dir, err)
 			}
 		}
+	}
+
+	if err := checkRemoteInSync("default", p[0], p[1]); err != nil {
+		return err
+	}
+	if err := checkRemoteInSync("default", p[0], p[2]); err != nil {
+		return err
+	}
+	if err := checkRemoteInSync(s12Folder, p[0], p[1]); err != nil {
+		return err
+	}
+	if err := checkRemoteInSync("s23", p[1], p[2]); err != nil {
+		return err
 	}
 
 	return nil

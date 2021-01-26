@@ -10,77 +10,41 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/shirou/gopsutil/v3/disk"
 
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/util"
-	"github.com/syncthing/syncthing/lib/versioner"
 )
 
 var (
 	ErrPathNotDirectory = errors.New("folder path not a directory")
 	ErrPathMissing      = errors.New("folder path missing")
-	ErrMarkerMissing    = errors.New("folder marker missing")
+	ErrMarkerMissing    = errors.New("folder marker missing (this indicates potential data loss, search docs/forum to get information about how to proceed)")
 )
 
-const DefaultMarkerName = ".stfolder"
-
-type FolderConfiguration struct {
-	ID                    string                      `xml:"id,attr" json:"id"`
-	Label                 string                      `xml:"label,attr" json:"label" restart:"false"`
-	FilesystemType        fs.FilesystemType           `xml:"filesystemType" json:"filesystemType"`
-	Path                  string                      `xml:"path,attr" json:"path"`
-	Type                  FolderType                  `xml:"type,attr" json:"type"`
-	Devices               []FolderDeviceConfiguration `xml:"device" json:"devices"`
-	RescanIntervalS       int                         `xml:"rescanIntervalS,attr" json:"rescanIntervalS"`
-	FSWatcherEnabled      bool                        `xml:"fsWatcherEnabled,attr" json:"fsWatcherEnabled"`
-	FSWatcherDelayS       int                         `xml:"fsWatcherDelayS,attr" json:"fsWatcherDelayS"`
-	IgnorePerms           bool                        `xml:"ignorePerms,attr" json:"ignorePerms"`
-	AutoNormalize         bool                        `xml:"autoNormalize,attr" json:"autoNormalize"`
-	MinDiskFree           Size                        `xml:"minDiskFree" json:"minDiskFree"`
-	Versioning            VersioningConfiguration     `xml:"versioning" json:"versioning"`
-	Copiers               int                         `xml:"copiers" json:"copiers"` // This defines how many files are handled concurrently.
-	PullerMaxPendingKiB   int                         `xml:"pullerMaxPendingKiB" json:"pullerMaxPendingKiB"`
-	Hashers               int                         `xml:"hashers" json:"hashers"` // Less than one sets the value to the number of cores. These are CPU bound due to hashing.
-	Order                 PullOrder                   `xml:"order" json:"order"`
-	IgnoreDelete          bool                        `xml:"ignoreDelete" json:"ignoreDelete"`
-	ScanProgressIntervalS int                         `xml:"scanProgressIntervalS" json:"scanProgressIntervalS"` // Set to a negative value to disable. Value of 0 will get replaced with value of 2 (default value)
-	PullerPauseS          int                         `xml:"pullerPauseS" json:"pullerPauseS"`
-	MaxConflicts          int                         `xml:"maxConflicts" json:"maxConflicts"`
-	DisableSparseFiles    bool                        `xml:"disableSparseFiles" json:"disableSparseFiles"`
-	DisableTempIndexes    bool                        `xml:"disableTempIndexes" json:"disableTempIndexes"`
-	Paused                bool                        `xml:"paused" json:"paused"`
-	WeakHashThresholdPct  int                         `xml:"weakHashThresholdPct" json:"weakHashThresholdPct"` // Use weak hash if more than X percent of the file has changed. Set to -1 to always use weak hash.
-	MarkerName            string                      `xml:"markerName" json:"markerName"`
-	UseLargeBlocks        bool                        `xml:"useLargeBlocks" json:"useLargeBlocks"`
-
-	cachedFilesystem fs.Filesystem
-
-	DeprecatedReadOnly       bool    `xml:"ro,attr,omitempty" json:"-"`
-	DeprecatedMinDiskFreePct float64 `xml:"minDiskFreePct,omitempty" json:"-"`
-	DeprecatedPullers        int     `xml:"pullers,omitempty" json:"-"`
-}
-
-type FolderDeviceConfiguration struct {
-	DeviceID     protocol.DeviceID `xml:"id,attr" json:"deviceID"`
-	IntroducedBy protocol.DeviceID `xml:"introducedBy,attr" json:"introducedBy"`
-}
+const (
+	DefaultMarkerName          = ".stfolder"
+	maxConcurrentWritesDefault = 2
+	maxConcurrentWritesLimit   = 64
+)
 
 func NewFolderConfiguration(myID protocol.DeviceID, id, label string, fsType fs.FilesystemType, path string) FolderConfiguration {
 	f := FolderConfiguration{
-		ID:               id,
-		Label:            label,
-		RescanIntervalS:  3600,
-		FSWatcherEnabled: true,
-		FSWatcherDelayS:  10,
-		MinDiskFree:      Size{Value: 1, Unit: "%"},
-		Devices:          []FolderDeviceConfiguration{{DeviceID: myID}},
-		AutoNormalize:    true,
-		MaxConflicts:     -1,
-		FilesystemType:   fsType,
-		Path:             path,
+		ID:             id,
+		Label:          label,
+		Devices:        []FolderDeviceConfiguration{{DeviceID: myID}},
+		FilesystemType: fsType,
+		Path:           path,
 	}
-	f.prepare()
+
+	util.SetDefaults(&f)
+
+	f.prepare(myID, nil)
 	return f
 }
 
@@ -95,23 +59,31 @@ func (f FolderConfiguration) Copy() FolderConfiguration {
 func (f FolderConfiguration) Filesystem() fs.Filesystem {
 	// This is intentionally not a pointer method, because things like
 	// cfg.Folders["default"].Filesystem() should be valid.
-	if f.cachedFilesystem == nil && f.Path != "" {
-		l.Infoln("bug: uncached filesystem call (should only happen in tests)")
-		return fs.NewFilesystem(f.FilesystemType, f.Path)
+	var opts []fs.Option
+	if f.FilesystemType == fs.FilesystemTypeBasic && f.JunctionsAsDirs {
+		opts = append(opts, fs.WithJunctionsAsDirs())
 	}
-	return f.cachedFilesystem
+	filesystem := fs.NewFilesystem(f.FilesystemType, f.Path, opts...)
+	if !f.CaseSensitiveFS {
+		filesystem = fs.NewCaseFilesystem(filesystem)
+	}
+	return filesystem
 }
 
-func (f FolderConfiguration) Versioner() versioner.Versioner {
-	if f.Versioning.Type == "" {
-		return nil
+func (f FolderConfiguration) ModTimeWindow() time.Duration {
+	dur := time.Duration(f.RawModTimeWindowS) * time.Second
+	if f.RawModTimeWindowS < 1 && runtime.GOOS == "android" {
+		if usage, err := disk.Usage(f.Filesystem().URI()); err != nil {
+			dur = 2 * time.Second
+			l.Debugf(`Detecting FS at "%v" on android: Setting mtime window to 2s: err == "%v"`, f.Path, err)
+		} else if usage.Fstype == "" || strings.Contains(strings.ToLower(usage.Fstype), "fat") || strings.Contains(strings.ToLower(usage.Fstype), "msdos") {
+			dur = 2 * time.Second
+			l.Debugf(`Detecting FS at "%v" on android: Setting mtime window to 2s: usage.Fstype == "%v"`, f.Path, usage.Fstype)
+		} else {
+			l.Debugf(`Detecting FS at %v on android: Leaving mtime window at 0: usage.Fstype == "%v"`, f.Path, usage.Fstype)
+		}
 	}
-	versionerFactory, ok := versioner.Factories[f.Versioning.Type]
-	if !ok {
-		l.Fatalf("Requested versioning type %q that does not exist", f.Versioning.Type)
-	}
-
-	return versionerFactory(f.ID, f.Filesystem(), f.Versioning.Params)
+	return dur
 }
 
 func (f *FolderConfiguration) CreateMarker() error {
@@ -211,10 +183,18 @@ func (f *FolderConfiguration) DeviceIDs() []protocol.DeviceID {
 	return deviceIDs
 }
 
-func (f *FolderConfiguration) prepare() {
-	if f.Path != "" {
-		f.cachedFilesystem = fs.NewFilesystem(f.FilesystemType, f.Path)
-	}
+func (f *FolderConfiguration) prepare(myID protocol.DeviceID, existingDevices map[protocol.DeviceID]bool) {
+	// Ensure that
+	// - any loose devices are not present in the wrong places
+	// - there are no duplicate devices
+	// - we are part of the devices
+	f.Devices = ensureExistingDevices(f.Devices, existingDevices)
+	f.Devices = ensureNoDuplicateFolderDevices(f.Devices)
+	f.Devices = ensureDevicePresent(f.Devices, myID)
+
+	sort.Slice(f.Devices, func(a, b int) bool {
+		return f.Devices[a].DeviceID.Compare(f.Devices[b].DeviceID) == -1
+	})
 
 	if f.RescanIntervalS > MaxRescanIntervalS {
 		f.RescanIntervalS = MaxRescanIntervalS
@@ -227,8 +207,10 @@ func (f *FolderConfiguration) prepare() {
 		f.FSWatcherDelayS = 10
 	}
 
-	if f.Versioning.Params == nil {
-		f.Versioning.Params = make(map[string]string)
+	if f.Versioning.CleanupIntervalS > MaxRescanIntervalS {
+		f.Versioning.CleanupIntervalS = MaxRescanIntervalS
+	} else if f.Versioning.CleanupIntervalS < 0 {
+		f.Versioning.CleanupIntervalS = 0
 	}
 
 	if f.WeakHashThresholdPct == 0 {
@@ -237,6 +219,12 @@ func (f *FolderConfiguration) prepare() {
 
 	if f.MarkerName == "" {
 		f.MarkerName = DefaultMarkerName
+	}
+
+	if f.MaxConcurrentWrites <= 0 {
+		f.MaxConcurrentWrites = maxConcurrentWritesDefault
+	} else if f.MaxConcurrentWrites > maxConcurrentWritesLimit {
+		f.MaxConcurrentWrites = maxConcurrentWritesLimit
 	}
 }
 
@@ -247,7 +235,6 @@ func (f FolderConfiguration) RequiresRestartOnly() FolderConfiguration {
 
 	// Manual handling for things that are not taken care of by the tag
 	// copier, yet should not cause a restart.
-	copy.cachedFilesystem = nil
 
 	blank := FolderConfiguration{}
 	util.CopyMatchingTag(&blank, &copy, "restart", func(v string) bool {
@@ -259,16 +246,21 @@ func (f FolderConfiguration) RequiresRestartOnly() FolderConfiguration {
 	return copy
 }
 
-func (f *FolderConfiguration) SharedWith(device protocol.DeviceID) bool {
+func (f *FolderConfiguration) Device(device protocol.DeviceID) (FolderDeviceConfiguration, bool) {
 	for _, dev := range f.Devices {
 		if dev.DeviceID == device {
-			return true
+			return dev, true
 		}
 	}
-	return false
+	return FolderDeviceConfiguration{}, false
 }
 
-func (f *FolderConfiguration) CheckAvailableSpace(req int64) error {
+func (f *FolderConfiguration) SharedWith(device protocol.DeviceID) bool {
+	_, ok := f.Device(device)
+	return ok
+}
+
+func (f *FolderConfiguration) CheckAvailableSpace(req uint64) error {
 	val := f.MinDiskFree.BaseValue()
 	if val <= 0 {
 		return nil
@@ -278,11 +270,8 @@ func (f *FolderConfiguration) CheckAvailableSpace(req int64) error {
 	if err != nil {
 		return nil
 	}
-	usage.Free -= req
-	if usage.Free > 0 {
-		if err := checkFreeSpace(f.MinDiskFree, usage); err == nil {
-			return nil
-		}
+	if !checkAvailableSpace(req, f.MinDiskFree, usage) {
+		return fmt.Errorf("insufficient space in %v %v", fs.Type(), fs.URI())
 	}
-	return fmt.Errorf("insufficient space in %v %v", fs.Type(), fs.URI())
+	return nil
 }

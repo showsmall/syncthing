@@ -17,10 +17,11 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/rcrowley/go-metrics"
+	metrics "github.com/rcrowley/go-metrics"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/ignore"
+	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"golang.org/x/text/unicode/norm"
 )
@@ -52,10 +53,12 @@ type Config struct {
 	// Optional progress tick interval which defines how often FolderScanProgress
 	// events are emitted. Negative number means disabled.
 	ProgressTickIntervalS int
-	// Whether to use large blocks for large files or the old standard of 128KiB for everything.
-	UseLargeBlocks bool
 	// Local flags to set on scanned files
 	LocalFlags uint32
+	// Modification time is to be considered unchanged if the difference is lower.
+	ModTimeWindow time.Duration
+	// Event logger to which the scan progress events are sent
+	EventLogger events.Logger
 }
 
 type CurrentFiler interface {
@@ -70,7 +73,15 @@ type ScanResult struct {
 }
 
 func Walk(ctx context.Context, cfg Config) chan ScanResult {
-	w := walker{cfg}
+	return newWalker(cfg).walk(ctx)
+}
+
+func WalkWithoutHashing(ctx context.Context, cfg Config) chan ScanResult {
+	return newWalker(cfg).walkWithoutHashing(ctx)
+}
+
+func newWalker(cfg Config) *walker {
+	w := &walker{cfg}
 
 	if w.CurrentFiler == nil {
 		w.CurrentFiler = noCurrentFiler{}
@@ -82,7 +93,7 @@ func Walk(ctx context.Context, cfg Config) chan ScanResult {
 		w.Matcher = ignore.New(w.Filesystem)
 	}
 
-	return w.walk(ctx)
+	return w
 }
 
 var (
@@ -105,17 +116,7 @@ func (w *walker) walk(ctx context.Context) chan ScanResult {
 
 	// A routine which walks the filesystem tree, and sends files which have
 	// been modified to the counter routine.
-	go func() {
-		hashFiles := w.walkAndHashFiles(ctx, toHashChan, finishedChan)
-		if len(w.Subs) == 0 {
-			w.Filesystem.Walk(".", hashFiles)
-		} else {
-			for _, sub := range w.Subs {
-				w.Filesystem.Walk(sub, hashFiles)
-			}
-		}
-		close(toHashChan)
-	}()
+	go w.scan(ctx, toHashChan, finishedChan)
 
 	// We're not required to emit scan progress events, just kick off hashers,
 	// and feed inputs directly from the walker.
@@ -168,7 +169,7 @@ func (w *walker) walk(ctx context.Context) chan ScanResult {
 					current := progress.Total()
 					rate := progress.Rate()
 					l.Debugf("Walk %s %s current progress %d/%d at %.01f MiB/s (%d%%)", w.Folder, w.Subs, current, total, rate/1024/1024, current*100/total)
-					events.Default.Log(events.FolderScanProgress, map[string]interface{}{
+					w.EventLogger.Log(events.FolderScanProgress, map[string]interface{}{
 						"folder":  w.Folder,
 						"current": current,
 						"total":   total,
@@ -194,6 +195,42 @@ func (w *walker) walk(ctx context.Context) chan ScanResult {
 	}()
 
 	return finishedChan
+}
+
+func (w *walker) walkWithoutHashing(ctx context.Context) chan ScanResult {
+	l.Debugln("Walk without hashing", w.Subs, w.Matcher)
+
+	toHashChan := make(chan protocol.FileInfo)
+	finishedChan := make(chan ScanResult)
+
+	// A routine which walks the filesystem tree, and sends files which have
+	// been modified to the counter routine.
+	go w.scan(ctx, toHashChan, finishedChan)
+
+	go func() {
+		for file := range toHashChan {
+			finishedChan <- ScanResult{File: file}
+		}
+		close(finishedChan)
+	}()
+
+	return finishedChan
+}
+
+func (w *walker) scan(ctx context.Context, toHashChan chan<- protocol.FileInfo, finishedChan chan<- ScanResult) {
+	hashFiles := w.walkAndHashFiles(ctx, toHashChan, finishedChan)
+	if len(w.Subs) == 0 {
+		w.Filesystem.Walk(".", hashFiles)
+	} else {
+		for _, sub := range w.Subs {
+			if err := osutil.TraversesSymlink(w.Filesystem, filepath.Dir(sub)); err != nil {
+				l.Debugf("Skip walking %v as it is below a symlink", sub)
+				continue
+			}
+			w.Filesystem.Walk(sub, hashFiles)
+		}
+	}
+	close(toHashChan)
 }
 
 func (w *walker) walkAndHashFiles(ctx context.Context, toHashChan chan<- protocol.FileInfo, finishedChan chan<- ScanResult) fs.WalkFunc {
@@ -258,7 +295,7 @@ func (w *walker) walkAndHashFiles(ctx context.Context, toHashChan chan<- protoco
 
 		if ignoredParent == "" {
 			// parent isn't ignored, nothing special
-			return w.handleItem(ctx, path, toHashChan, finishedChan, skip)
+			return w.handleItem(ctx, path, info, toHashChan, finishedChan, skip)
 		}
 
 		// Part of current path below the ignored (potential) parent
@@ -267,17 +304,22 @@ func (w *walker) walkAndHashFiles(ctx context.Context, toHashChan chan<- protoco
 		// ignored path isn't actually a parent of the current path
 		if rel == path {
 			ignoredParent = ""
-			return w.handleItem(ctx, path, toHashChan, finishedChan, skip)
+			return w.handleItem(ctx, path, info, toHashChan, finishedChan, skip)
 		}
 
 		// The previously ignored parent directories of the current, not
 		// ignored path need to be handled as well.
-		if err = w.handleItem(ctx, ignoredParent, toHashChan, finishedChan, skip); err != nil {
-			return err
-		}
-		for _, name := range strings.Split(rel, string(fs.PathSeparator)) {
+		// Prepend an empty string to handle ignoredParent without anything
+		// appended in the first iteration.
+		for _, name := range append([]string{""}, strings.Split(rel, string(fs.PathSeparator))...) {
 			ignoredParent = filepath.Join(ignoredParent, name)
-			if err = w.handleItem(ctx, ignoredParent, toHashChan, finishedChan, skip); err != nil {
+			info, err = w.Filesystem.Lstat(ignoredParent)
+			// An error here would be weird as we've already gotten to this point, but act on it nonetheless
+			if err != nil {
+				w.handleError(ctx, "scan", ignoredParent, err, finishedChan)
+				return skip
+			}
+			if err = w.handleItem(ctx, ignoredParent, info, toHashChan, finishedChan, skip); err != nil {
 				return err
 			}
 		}
@@ -287,16 +329,9 @@ func (w *walker) walkAndHashFiles(ctx context.Context, toHashChan chan<- protoco
 	}
 }
 
-func (w *walker) handleItem(ctx context.Context, path string, toHashChan chan<- protocol.FileInfo, finishedChan chan<- ScanResult, skip error) error {
-	info, err := w.Filesystem.Lstat(path)
-	// An error here would be weird as we've already gotten to this point, but act on it nonetheless
-	if err != nil {
-		w.handleError(ctx, "scan", path, err, finishedChan)
-		return skip
-	}
-
+func (w *walker) handleItem(ctx context.Context, path string, info fs.FileInfo, toHashChan chan<- protocol.FileInfo, finishedChan chan<- ScanResult, skip error) error {
 	oldPath := path
-	path, err = w.normalizePath(path, info)
+	path, err := w.normalizePath(path, info)
 	if err != nil {
 		w.handleError(ctx, "normalizing path", oldPath, err, finishedChan)
 		return skip
@@ -304,7 +339,7 @@ func (w *walker) handleItem(ctx context.Context, path string, toHashChan chan<- 
 
 	switch {
 	case info.IsSymlink():
-		if err := w.walkSymlink(ctx, path, finishedChan); err != nil {
+		if err := w.walkSymlink(ctx, path, info, finishedChan); err != nil {
 			return err
 		}
 		if info.IsDir() {
@@ -326,33 +361,29 @@ func (w *walker) handleItem(ctx context.Context, path string, toHashChan chan<- 
 func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileInfo, toHashChan chan<- protocol.FileInfo) error {
 	curFile, hasCurFile := w.CurrentFiler.CurrentFile(relPath)
 
-	blockSize := protocol.MinBlockSize
+	blockSize := protocol.BlockSize(info.Size())
 
-	if w.UseLargeBlocks {
-		blockSize = protocol.BlockSize(info.Size())
-
-		if hasCurFile {
-			// Check if we should retain current block size.
-			curBlockSize := curFile.BlockSize()
-			if blockSize > curBlockSize && blockSize/curBlockSize <= 2 {
-				// New block size is larger, but not more than twice larger.
-				// Retain.
-				blockSize = curBlockSize
-			} else if curBlockSize > blockSize && curBlockSize/blockSize <= 2 {
-				// Old block size is larger, but not more than twice larger.
-				// Retain.
-				blockSize = curBlockSize
-			}
+	if hasCurFile {
+		// Check if we should retain current block size.
+		curBlockSize := curFile.BlockSize()
+		if blockSize > curBlockSize && blockSize/curBlockSize <= 2 {
+			// New block size is larger, but not more than twice larger.
+			// Retain.
+			blockSize = curBlockSize
+		} else if curBlockSize > blockSize && curBlockSize/blockSize <= 2 {
+			// Old block size is larger, but not more than twice larger.
+			// Retain.
+			blockSize = curBlockSize
 		}
 	}
 
 	f, _ := CreateFileInfo(info, relPath, nil)
 	f = w.updateFileInfo(f, curFile)
 	f.NoPermissions = w.IgnorePerms
-	f.RawBlockSize = int32(blockSize)
+	f.RawBlockSize = blockSize
 
 	if hasCurFile {
-		if curFile.IsEquivalentOptional(f, w.IgnorePerms, true, w.LocalFlags) {
+		if curFile.IsEquivalentOptional(f, w.ModTimeWindow, w.IgnorePerms, true, w.LocalFlags) {
 			return nil
 		}
 		if curFile.ShouldConflict() {
@@ -385,7 +416,7 @@ func (w *walker) walkDir(ctx context.Context, relPath string, info fs.FileInfo, 
 	f.NoPermissions = w.IgnorePerms
 
 	if hasCurFile {
-		if curFile.IsEquivalentOptional(f, w.IgnorePerms, true, w.LocalFlags) {
+		if curFile.IsEquivalentOptional(f, w.ModTimeWindow, w.IgnorePerms, true, w.LocalFlags) {
 			return nil
 		}
 		if curFile.ShouldConflict() {
@@ -411,19 +442,14 @@ func (w *walker) walkDir(ctx context.Context, relPath string, info fs.FileInfo, 
 
 // walkSymlink returns nil or an error, if the error is of the nature that
 // it should stop the entire walk.
-func (w *walker) walkSymlink(ctx context.Context, relPath string, finishedChan chan<- ScanResult) error {
+func (w *walker) walkSymlink(ctx context.Context, relPath string, info fs.FileInfo, finishedChan chan<- ScanResult) error {
 	// Symlinks are not supported on Windows. We ignore instead of returning
 	// an error.
 	if runtime.GOOS == "windows" {
 		return nil
 	}
 
-	// We always rehash symlinks as they have no modtime or
-	// permissions. We check if they point to the old target by
-	// checking that their existing blocks match with the blocks in
-	// the index.
-
-	target, err := w.Filesystem.ReadSymlink(relPath)
+	f, err := CreateFileInfo(info, relPath, w.Filesystem)
 	if err != nil {
 		w.handleError(ctx, "reading link:", relPath, err, finishedChan)
 		return nil
@@ -431,16 +457,10 @@ func (w *walker) walkSymlink(ctx context.Context, relPath string, finishedChan c
 
 	curFile, hasCurFile := w.CurrentFiler.CurrentFile(relPath)
 
-	f := protocol.FileInfo{
-		Name:          relPath,
-		Type:          protocol.FileInfoTypeSymlink,
-		NoPermissions: true, // Symlinks don't have permissions of their own
-		SymlinkTarget: target,
-	}
 	f = w.updateFileInfo(f, curFile)
 
 	if hasCurFile {
-		if curFile.IsEquivalentOptional(f, w.IgnorePerms, true, w.LocalFlags) {
+		if curFile.IsEquivalentOptional(f, w.ModTimeWindow, w.IgnorePerms, true, w.LocalFlags) {
 			return nil
 		}
 		if curFile.ShouldConflict() {
@@ -541,20 +561,23 @@ func (w *walker) handleError(ctx context.Context, context, path string, err erro
 	if fs.IsNotExist(err) {
 		return
 	}
-	l.Infof("Scanner (folder %s, file %q): %s: %v", w.Folder, path, context, err)
 	select {
 	case finishedChan <- ScanResult{
-		Err:  fmt.Errorf("%s: %s", context, err.Error()),
+		Err:  fmt.Errorf("%s: %w", context, err),
 		Path: path,
 	}:
 	case <-ctx.Done():
 	}
 }
 
+func (w *walker) String() string {
+	return fmt.Sprintf("walker/%s@%p", w.Folder, w)
+}
+
 // A byteCounter gets bytes added to it via Update() and then provides the
 // Total() and one minute moving average Rate() in bytes per second.
 type byteCounter struct {
-	total int64
+	total int64 // atomic, must remain 64-bit aligned
 	metrics.EWMA
 	stop chan struct{}
 }
@@ -613,11 +636,12 @@ func CreateFileInfo(fi fs.FileInfo, name string, filesystem fs.Filesystem) (prot
 			return protocol.FileInfo{}, err
 		}
 		f.SymlinkTarget = target
+		f.NoPermissions = true // Symlinks don't have permissions of their own
 		return f, nil
 	}
 	f.Permissions = uint32(fi.Mode() & fs.ModePerm)
 	f.ModifiedS = fi.ModTime().Unix()
-	f.ModifiedNs = int32(fi.ModTime().Nanosecond())
+	f.ModifiedNs = fi.ModTime().Nanosecond()
 	if fi.IsDir() {
 		f.Type = protocol.FileInfoTypeDirectory
 		return f, nil

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rc"
 )
@@ -24,12 +25,12 @@ import (
 func TestOverride(t *testing.T) {
 	// Enable "send-only" on s1/default
 	id, _ := protocol.DeviceIDFromString(id1)
-	cfg, _ := config.Load("h1/config.xml", id)
+	cfg, _, _ := config.Load("h1/config.xml", id, events.NoopLogger)
 	fld := cfg.Folders()["default"]
 	fld.Type = config.FolderTypeSendOnly
 	cfg.SetFolder(fld)
-	t.Log(os.Rename("h1/config.xml", "h1/config.xml.orig"))
-	defer t.Log(os.Rename("h1/config.xml.orig", "h1/config.xml"))
+	os.Rename("h1/config.xml", "h1/config.xml.orig")
+	defer os.Rename("h1/config.xml.orig", "h1/config.xml")
 	cfg.Save()
 
 	log.Println("Cleaning...")
@@ -156,7 +157,7 @@ get to completion when in sendOnly/sendRecv mode. Needs fixing.
 func TestOverrideIgnores(t *testing.T) {
 	// Enable "sendOnly" on s1/default
 	id, _ := protocol.DeviceIDFromString(id1)
-	cfg, _ := config.Load("h1/config.xml", id)
+	cfg, _, _ := config.Load("h1/config.xml", id, events.NoopLogger)
 	fld := cfg.Folders()["default"]
 	fld.ReadOnly = true
 	cfg.SetFolder(fld)

@@ -9,10 +9,9 @@ package sync
 import (
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
-	"github.com/sasha-s/go-deadlock"
+	deadlock "github.com/sasha-s/go-deadlock"
 	"github.com/syncthing/syncthing/lib/logger"
 )
 
@@ -23,13 +22,11 @@ var (
 	// We make an exception in this package and have an actual "if debug { ...
 	// }" variable, as it may be rather performance critical and does
 	// nonstandard things (from a debug logging PoV).
-	debug       = strings.Contains(os.Getenv("STTRACE"), "sync") || os.Getenv("STTRACE") == "all"
+	debug       = logger.DefaultLogger.ShouldDebug("sync")
 	useDeadlock = false
 )
 
 func init() {
-	l.SetDebug("sync", strings.Contains(os.Getenv("STTRACE"), "sync") || os.Getenv("STTRACE") == "all")
-
 	if n, _ := strconv.Atoi(os.Getenv("STLOCKTHRESHOLD")); n > 0 {
 		threshold = time.Duration(n) * time.Millisecond
 	}

@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"flag"
 	"log"
@@ -19,6 +20,9 @@ import (
 )
 
 func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	log.SetOutput(os.Stdout)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
@@ -59,7 +63,7 @@ func main() {
 		}
 		log.Println("Created client")
 
-		go relay.Serve()
+		go relay.Serve(ctx)
 
 		recv := make(chan protocol.SessionInvitation)
 
@@ -76,7 +80,7 @@ func main() {
 		}()
 
 		for {
-			conn, err := client.JoinSession(<-recv)
+			conn, err := client.JoinSession(ctx, <-recv)
 			if err != nil {
 				log.Fatalln("Failed to join", err)
 			}
@@ -90,13 +94,13 @@ func main() {
 			log.Fatal(err)
 		}
 
-		invite, err := client.GetInvitationFromRelay(uri, id, []tls.Certificate{cert}, 10*time.Second)
+		invite, err := client.GetInvitationFromRelay(ctx, uri, id, []tls.Certificate{cert}, 10*time.Second)
 		if err != nil {
 			log.Fatal(err)
 		}
 
 		log.Println("Received invitation", invite)
-		conn, err := client.JoinSession(invite)
+		conn, err := client.JoinSession(ctx, invite)
 		if err != nil {
 			log.Fatalln("Failed to join", err)
 		}
@@ -104,10 +108,10 @@ func main() {
 		connectToStdio(stdin, conn)
 		log.Println("Finished", conn.RemoteAddr(), conn.LocalAddr())
 	} else if test {
-		if client.TestRelay(uri, []tls.Certificate{cert}, time.Second, 2*time.Second, 4) {
+		if err := client.TestRelay(ctx, uri, []tls.Certificate{cert}, time.Second, 2*time.Second, 4); err == nil {
 			log.Println("OK")
 		} else {
-			log.Println("FAIL")
+			log.Println("FAIL:", err)
 		}
 	} else {
 		log.Fatal("Requires either join or connect")

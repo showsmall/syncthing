@@ -66,6 +66,23 @@ function folderCompare(a, b) {
     return labelA > labelB;
 }
 
+function deviceMap(l) {
+    var m = {};
+    l.forEach(function (r) {
+        m[r.deviceID] = r;
+    });
+    return m;
+}
+
+function deviceList(m) {
+    var l = [];
+    for (var id in m) {
+        l.push(m[id]);
+    }
+    l.sort(deviceCompare);
+    return l;
+}
+
 function folderMap(l) {
     var m = {};
     l.forEach(function (r) {
@@ -179,7 +196,7 @@ function buildTree(children) {
                     key: keySoFar.join('/'),
                     folder: true,
                     children: []
-                }
+                };
                 parent.children.push(child);
                 parent = child;
             }
@@ -209,7 +226,7 @@ function unitPrefixed(input, binary) {
     var i = '';
     if (binary) {
         factor = 1024;
-        i = 'i'
+        i = 'i';
     }
     if (input > factor * factor * factor * factor * 1000) {
         // Don't show any decimals for more than 4 digits

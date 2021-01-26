@@ -19,7 +19,11 @@ const (
 	FolderIdle folderState = iota
 	FolderScanning
 	FolderScanWaiting
+	FolderSyncWaiting
+	FolderSyncPreparing
 	FolderSyncing
+	FolderCleaning
+	FolderCleanWaiting
 	FolderError
 )
 
@@ -31,8 +35,16 @@ func (s folderState) String() string {
 		return "scanning"
 	case FolderScanWaiting:
 		return "scan-waiting"
+	case FolderSyncWaiting:
+		return "sync-waiting"
+	case FolderSyncPreparing:
+		return "sync-preparing"
 	case FolderSyncing:
 		return "syncing"
+	case FolderCleaning:
+		return "cleaning"
+	case FolderCleanWaiting:
+		return "clean-waiting"
 	case FolderError:
 		return "error"
 	default:
@@ -42,6 +54,7 @@ func (s folderState) String() string {
 
 type stateTracker struct {
 	folderID string
+	evLogger events.Logger
 
 	mut     sync.Mutex
 	current folderState
@@ -49,9 +62,10 @@ type stateTracker struct {
 	changed time.Time
 }
 
-func newStateTracker(id string) stateTracker {
+func newStateTracker(id string, evLogger events.Logger) stateTracker {
 	return stateTracker{
 		folderID: id,
+		evLogger: evLogger,
 		mut:      sync.NewMutex(),
 	}
 }
@@ -63,29 +77,32 @@ func (s *stateTracker) setState(newState folderState) {
 	}
 
 	s.mut.Lock()
-	if newState != s.current {
-		/* This should hold later...
-		if s.current != FolderIdle && (newState == FolderScanning || newState == FolderSyncing) {
-			panic("illegal state transition " + s.current.String() + " -> " + newState.String())
-		}
-		*/
+	defer s.mut.Unlock()
 
-		eventData := map[string]interface{}{
-			"folder": s.folderID,
-			"to":     newState.String(),
-			"from":   s.current.String(),
-		}
-
-		if !s.changed.IsZero() {
-			eventData["duration"] = time.Since(s.changed).Seconds()
-		}
-
-		s.current = newState
-		s.changed = time.Now()
-
-		events.Default.Log(events.StateChanged, eventData)
+	if newState == s.current {
+		return
 	}
-	s.mut.Unlock()
+
+	/* This should hold later...
+	if s.current != FolderIdle && (newState == FolderScanning || newState == FolderSyncing) {
+		panic("illegal state transition " + s.current.String() + " -> " + newState.String())
+	}
+	*/
+
+	eventData := map[string]interface{}{
+		"folder": s.folderID,
+		"to":     newState.String(),
+		"from":   s.current.String(),
+	}
+
+	if !s.changed.IsZero() {
+		eventData["duration"] = time.Since(s.changed).Seconds()
+	}
+
+	s.current = newState
+	s.changed = time.Now()
+
+	s.evLogger.Log(events.StateChanged, eventData)
 }
 
 // getState returns the current state, the time when it last changed, and the
@@ -124,5 +141,5 @@ func (s *stateTracker) setError(err error) {
 	s.err = err
 	s.changed = time.Now()
 
-	events.Default.Log(events.StateChanged, eventData)
+	s.evLogger.Log(events.StateChanged, eventData)
 }

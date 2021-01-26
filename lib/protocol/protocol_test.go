@@ -4,17 +4,21 @@ package protocol
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"io/ioutil"
 	"runtime"
-	"strings"
+	"sync"
 	"testing"
 	"testing/quick"
+	"time"
 
 	"github.com/syncthing/syncthing/lib/rand"
+	"github.com/syncthing/syncthing/lib/testutils"
 )
 
 var (
@@ -27,10 +31,12 @@ func TestPing(t *testing.T) {
 	ar, aw := io.Pipe()
 	br, bw := io.Pipe()
 
-	c0 := NewConnection(c0ID, ar, bw, newTestModel(), "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
+	c0 := NewConnection(c0ID, ar, bw, testutils.NoopCloser{}, newTestModel(), &testutils.FakeConnectionInfo{"name"}, CompressionAlways).(wireFormatConnection).Connection.(*rawConnection)
 	c0.Start()
-	c1 := NewConnection(c1ID, br, aw, newTestModel(), "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
+	defer closeAndWait(c0, ar, bw)
+	c1 := NewConnection(c1ID, br, aw, testutils.NoopCloser{}, newTestModel(), &testutils.FakeConnectionInfo{"name"}, CompressionAlways).(wireFormatConnection).Connection.(*rawConnection)
 	c1.Start()
+	defer closeAndWait(c1, ar, bw)
 	c0.ClusterConfig(ClusterConfig{})
 	c1.ClusterConfig(ClusterConfig{})
 
@@ -42,6 +48,8 @@ func TestPing(t *testing.T) {
 	}
 }
 
+var errManual = errors.New("manual close")
+
 func TestClose(t *testing.T) {
 	m0 := newTestModel()
 	m1 := newTestModel()
@@ -49,17 +57,19 @@ func TestClose(t *testing.T) {
 	ar, aw := io.Pipe()
 	br, bw := io.Pipe()
 
-	c0 := NewConnection(c0ID, ar, bw, m0, "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
+	c0 := NewConnection(c0ID, ar, bw, testutils.NoopCloser{}, m0, &testutils.FakeConnectionInfo{"name"}, CompressionAlways).(wireFormatConnection).Connection.(*rawConnection)
 	c0.Start()
-	c1 := NewConnection(c1ID, br, aw, m1, "name", CompressAlways)
+	defer closeAndWait(c0, ar, bw)
+	c1 := NewConnection(c1ID, br, aw, testutils.NoopCloser{}, m1, &testutils.FakeConnectionInfo{"name"}, CompressionAlways)
 	c1.Start()
+	defer closeAndWait(c1, ar, bw)
 	c0.ClusterConfig(ClusterConfig{})
 	c1.ClusterConfig(ClusterConfig{})
 
-	c0.close(errors.New("manual close"))
+	c0.internalClose(errManual)
 
 	<-c0.closed
-	if err := m0.closedError(); err == nil || !strings.Contains(err.Error(), "manual close") {
+	if err := m0.closedError(); err != errManual {
 		t.Fatal("Connection should be closed")
 	}
 
@@ -69,11 +79,186 @@ func TestClose(t *testing.T) {
 		t.Error("Ping should not return true")
 	}
 
-	c0.Index("default", nil)
-	c0.Index("default", nil)
+	ctx := context.Background()
 
-	if _, err := c0.Request("default", "foo", 0, 0, nil, 0, false); err == nil {
+	c0.Index(ctx, "default", nil)
+	c0.Index(ctx, "default", nil)
+
+	if _, err := c0.Request(ctx, "default", "foo", 0, 0, 0, nil, 0, false); err == nil {
 		t.Error("Request should return an error")
+	}
+}
+
+// TestCloseOnBlockingSend checks that the connection does not deadlock when
+// Close is called while the underlying connection is broken (send blocks).
+// https://github.com/syncthing/syncthing/pull/5442
+func TestCloseOnBlockingSend(t *testing.T) {
+	oldCloseTimeout := CloseTimeout
+	CloseTimeout = 100 * time.Millisecond
+	defer func() {
+		CloseTimeout = oldCloseTimeout
+	}()
+
+	m := newTestModel()
+
+	rw := testutils.NewBlockingRW()
+	c := NewConnection(c0ID, rw, rw, testutils.NoopCloser{}, m, &testutils.FakeConnectionInfo{"name"}, CompressionAlways).(wireFormatConnection).Connection.(*rawConnection)
+	c.Start()
+	defer closeAndWait(c, rw)
+
+	wg := sync.WaitGroup{}
+
+	wg.Add(1)
+	go func() {
+		c.ClusterConfig(ClusterConfig{})
+		wg.Done()
+	}()
+
+	wg.Add(1)
+	go func() {
+		c.Close(errManual)
+		wg.Done()
+	}()
+
+	// This simulates an error from ping timeout
+	wg.Add(1)
+	go func() {
+		c.internalClose(ErrTimeout)
+		wg.Done()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out before all functions returned")
+	}
+}
+
+func TestCloseRace(t *testing.T) {
+	indexReceived := make(chan struct{})
+	unblockIndex := make(chan struct{})
+	m0 := newTestModel()
+	m0.indexFn = func(_ DeviceID, _ string, _ []FileInfo) {
+		close(indexReceived)
+		<-unblockIndex
+	}
+	m1 := newTestModel()
+
+	ar, aw := io.Pipe()
+	br, bw := io.Pipe()
+
+	c0 := NewConnection(c0ID, ar, bw, testutils.NoopCloser{}, m0, &testutils.FakeConnectionInfo{"c0"}, CompressionNever).(wireFormatConnection).Connection.(*rawConnection)
+	c0.Start()
+	defer closeAndWait(c0, ar, bw)
+	c1 := NewConnection(c1ID, br, aw, testutils.NoopCloser{}, m1, &testutils.FakeConnectionInfo{"c1"}, CompressionNever)
+	c1.Start()
+	defer closeAndWait(c1, ar, bw)
+	c0.ClusterConfig(ClusterConfig{})
+	c1.ClusterConfig(ClusterConfig{})
+
+	c1.Index(context.Background(), "default", nil)
+	select {
+	case <-indexReceived:
+	case <-time.After(time.Second):
+		t.Fatal("timed out before receiving index")
+	}
+
+	go c0.internalClose(errManual)
+	select {
+	case <-c0.closed:
+	case <-time.After(time.Second):
+		t.Fatal("timed out before c0.closed was closed")
+	}
+
+	select {
+	case <-m0.closedCh:
+		t.Errorf("receiver.Closed called before receiver.Index")
+	default:
+	}
+
+	close(unblockIndex)
+
+	if err := m0.closedError(); err != errManual {
+		t.Fatal("Connection should be closed")
+	}
+}
+
+func TestClusterConfigFirst(t *testing.T) {
+	m := newTestModel()
+
+	rw := testutils.NewBlockingRW()
+	c := NewConnection(c0ID, rw, &testutils.NoopRW{}, testutils.NoopCloser{}, m, &testutils.FakeConnectionInfo{"name"}, CompressionAlways).(wireFormatConnection).Connection.(*rawConnection)
+	c.Start()
+	defer closeAndWait(c, rw)
+
+	select {
+	case c.outbox <- asyncMessage{&Ping{}, nil}:
+		t.Fatal("able to send ping before cluster config")
+	case <-time.After(100 * time.Millisecond):
+		// Allow some time for c.writerLoop to setup after c.Start
+	}
+
+	c.ClusterConfig(ClusterConfig{})
+
+	done := make(chan struct{})
+	if ok := c.send(context.Background(), &Ping{}, done); !ok {
+		t.Fatal("send ping after cluster config returned false")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out before ping was sent")
+	}
+
+	done = make(chan struct{})
+	go func() {
+		c.internalClose(errManual)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close didn't return before timeout")
+	}
+
+	if err := m.closedError(); err != errManual {
+		t.Fatal("Connection should be closed")
+	}
+}
+
+// TestCloseTimeout checks that calling Close times out and proceeds, if sending
+// the close message does not succeed.
+func TestCloseTimeout(t *testing.T) {
+	oldCloseTimeout := CloseTimeout
+	CloseTimeout = 100 * time.Millisecond
+	defer func() {
+		CloseTimeout = oldCloseTimeout
+	}()
+
+	m := newTestModel()
+
+	rw := testutils.NewBlockingRW()
+	c := NewConnection(c0ID, rw, rw, testutils.NoopCloser{}, m, &testutils.FakeConnectionInfo{"name"}, CompressionAlways).(wireFormatConnection).Connection.(*rawConnection)
+	c.Start()
+	defer closeAndWait(c, rw)
+
+	done := make(chan struct{})
+	go func() {
+		c.Close(errManual)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * CloseTimeout):
+		t.Fatal("timed out before Close returned")
 	}
 }
 
@@ -87,6 +272,12 @@ func TestMarshalIndexMessage(t *testing.T) {
 			m1.Files = nil
 		}
 		for i, f := range m1.Files {
+			if len(f.BlocksHash) == 0 {
+				m1.Files[i].BlocksHash = nil
+			}
+			if len(f.VersionHash) == 0 {
+				m1.Files[i].VersionHash = nil
+			}
 			if len(f.Blocks) == 0 {
 				m1.Files[i].Blocks = nil
 			} else {
@@ -99,6 +290,9 @@ func TestMarshalIndexMessage(t *testing.T) {
 			}
 			if len(f.Version.Counters) == 0 {
 				m1.Files[i].Version.Counters = nil
+			}
+			if len(f.Encrypted) == 0 {
+				m1.Files[i].Encrypted = nil
 			}
 		}
 
@@ -157,7 +351,16 @@ func TestMarshalClusterConfigMessage(t *testing.T) {
 			if len(m1.Folders[i].Devices) == 0 {
 				m1.Folders[i].Devices = nil
 			}
+			for j := range m1.Folders[i].Devices {
+				if len(m1.Folders[i].Devices[j].Addresses) == 0 {
+					m1.Folders[i].Devices[j].Addresses = nil
+				}
+				if len(m1.Folders[i].Devices[j].EncryptionPasswordToken) == 0 {
+					m1.Folders[i].Devices[j].EncryptionPasswordToken = nil
+				}
+			}
 		}
+
 		return testMarshal(t, "clusterconfig", &m1, &ClusterConfig{})
 	}
 
@@ -189,7 +392,10 @@ func TestMarshalFDPU(t *testing.T) {
 		if len(m1.Version.Counters) == 0 {
 			m1.Version.Counters = nil
 		}
-		return testMarshal(t, "close", &m1, &FileDownloadProgressUpdate{})
+		if len(m1.BlockIndexes) == 0 {
+			m1.BlockIndexes = nil
+		}
+		return testMarshal(t, "fdpu", &m1, &FileDownloadProgressUpdate{})
 	}
 
 	if err := quick.Check(f, quickCfg); err != nil {
@@ -261,6 +467,38 @@ func TestLZ4Compression(t *testing.T) {
 			t.Error("Incorrect decompressed data")
 		}
 		t.Logf("OK #%d, %d -> %d -> %d", i, dataLen, len(comp), dataLen)
+	}
+}
+
+func TestStressLZ4CompressGrows(t *testing.T) {
+	c := new(rawConnection)
+	success := 0
+	for i := 0; i < 100; i++ {
+		// Create a slize that is precisely one min block size, fill it with
+		// random data. This shouldn't compress at all, so will in fact
+		// become larger when LZ4 does its thing.
+		data := make([]byte, MinBlockSize)
+		if _, err := rand.Reader.Read(data); err != nil {
+			t.Fatal("randomness failure")
+		}
+
+		comp, err := c.lz4Compress(data)
+		if err != nil {
+			t.Fatal("unexpected compression error: ", err)
+		}
+		if len(comp) < len(data) {
+			// data size should grow. We must have been really unlucky in
+			// the random generation, try again.
+			continue
+		}
+
+		// Putting it into the buffer pool shouldn't panic because the block
+		// should come from there to begin with.
+		BufferPool.Put(comp)
+		success++
+	}
+	if success == 0 {
+		t.Fatal("unable to find data that grows when compressed")
 	}
 }
 
@@ -600,13 +838,141 @@ func TestIsEquivalent(t *testing.T) {
 					continue
 				}
 
-				if res := tc.a.isEquivalent(tc.b, ignPerms, ignBlocks, tc.ignFlags); res != tc.eq {
+				if res := tc.a.isEquivalent(tc.b, 0, ignPerms, ignBlocks, tc.ignFlags); res != tc.eq {
 					t.Errorf("Case %d:\na: %v\nb: %v\na.IsEquivalent(b, %v, %v) => %v, expected %v", i, tc.a, tc.b, ignPerms, ignBlocks, res, tc.eq)
 				}
-				if res := tc.b.isEquivalent(tc.a, ignPerms, ignBlocks, tc.ignFlags); res != tc.eq {
+				if res := tc.b.isEquivalent(tc.a, 0, ignPerms, ignBlocks, tc.ignFlags); res != tc.eq {
 					t.Errorf("Case %d:\na: %v\nb: %v\nb.IsEquivalent(a, %v, %v) => %v, expected %v", i, tc.a, tc.b, ignPerms, ignBlocks, res, tc.eq)
 				}
 			}
 		}
 	}
+}
+
+func TestSha256OfEmptyBlock(t *testing.T) {
+	// every block size should have a correct entry in sha256OfEmptyBlock
+	for blockSize := MinBlockSize; blockSize <= MaxBlockSize; blockSize *= 2 {
+		expected := sha256.Sum256(make([]byte, blockSize))
+		if sha256OfEmptyBlock[blockSize] != expected {
+			t.Error("missing or wrong hash for block of size", blockSize)
+		}
+	}
+}
+
+// TestClusterConfigAfterClose checks that ClusterConfig does not deadlock when
+// ClusterConfig is called on a closed connection.
+func TestClusterConfigAfterClose(t *testing.T) {
+	m := newTestModel()
+
+	rw := testutils.NewBlockingRW()
+	c := NewConnection(c0ID, rw, rw, testutils.NoopCloser{}, m, &testutils.FakeConnectionInfo{"name"}, CompressionAlways).(wireFormatConnection).Connection.(*rawConnection)
+	c.Start()
+	defer closeAndWait(c, rw)
+
+	c.internalClose(errManual)
+
+	done := make(chan struct{})
+	go func() {
+		c.ClusterConfig(ClusterConfig{})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out before Cluster Config returned")
+	}
+}
+
+func TestDispatcherToCloseDeadlock(t *testing.T) {
+	// Verify that we don't deadlock when calling Close() from within one of
+	// the model callbacks (ClusterConfig).
+	m := newTestModel()
+	rw := testutils.NewBlockingRW()
+	c := NewConnection(c0ID, rw, &testutils.NoopRW{}, testutils.NoopCloser{}, m, &testutils.FakeConnectionInfo{"name"}, CompressionAlways).(wireFormatConnection).Connection.(*rawConnection)
+	m.ccFn = func(devID DeviceID, cc ClusterConfig) {
+		c.Close(errManual)
+	}
+	c.Start()
+	defer closeAndWait(c, rw)
+
+	c.inbox <- &ClusterConfig{}
+
+	select {
+	case <-c.dispatcherLoopStopped:
+	case <-time.After(time.Second):
+		t.Fatal("timed out before dispatcher loop terminated")
+	}
+}
+
+func TestBlocksEqual(t *testing.T) {
+	blocksOne := []BlockInfo{{Hash: []byte{1, 2, 3, 4}}}
+	blocksTwo := []BlockInfo{{Hash: []byte{5, 6, 7, 8}}}
+	hashOne := []byte{42, 42, 42, 42}
+	hashTwo := []byte{29, 29, 29, 29}
+
+	cases := []struct {
+		b1 []BlockInfo
+		h1 []byte
+		b2 []BlockInfo
+		h2 []byte
+		eq bool
+	}{
+		{blocksOne, hashOne, blocksOne, hashOne, true},  // everything equal
+		{blocksOne, hashOne, blocksTwo, hashTwo, false}, // nothing equal
+		{blocksOne, hashOne, blocksOne, nil, true},      // blocks compared
+		{blocksOne, nil, blocksOne, nil, true},          // blocks compared
+		{blocksOne, nil, blocksTwo, nil, false},         // blocks compared
+		{blocksOne, hashOne, blocksTwo, hashOne, true},  // hashes equal, blocks not looked at
+		{blocksOne, hashOne, blocksOne, hashTwo, true},  // hashes different, blocks compared
+		{blocksOne, hashOne, blocksTwo, hashTwo, false}, // hashes different, blocks compared
+		{blocksOne, hashOne, nil, nil, false},           // blocks is different from no blocks
+		{blocksOne, nil, nil, nil, false},               // blocks is different from no blocks
+		{nil, hashOne, nil, nil, true},                  // nil blocks are equal, even of one side has a hash
+	}
+
+	for _, tc := range cases {
+		f1 := FileInfo{Blocks: tc.b1, BlocksHash: tc.h1}
+		f2 := FileInfo{Blocks: tc.b2, BlocksHash: tc.h2}
+
+		if !f1.BlocksEqual(f1) {
+			t.Error("f1 is always equal to itself", f1)
+		}
+		if !f2.BlocksEqual(f2) {
+			t.Error("f2 is always equal to itself", f2)
+		}
+		if res := f1.BlocksEqual(f2); res != tc.eq {
+			t.Log("f1", f1.BlocksHash, f1.Blocks)
+			t.Log("f2", f2.BlocksHash, f2.Blocks)
+			t.Errorf("f1.BlocksEqual(f2) == %v but should be %v", res, tc.eq)
+		}
+		if res := f2.BlocksEqual(f1); res != tc.eq {
+			t.Log("f1", f1.BlocksHash, f1.Blocks)
+			t.Log("f2", f2.BlocksHash, f2.Blocks)
+			t.Errorf("f2.BlocksEqual(f1) == %v but should be %v", res, tc.eq)
+		}
+	}
+}
+
+func TestIndexIDString(t *testing.T) {
+	// Index ID is a 64 bit, zero padded hex integer.
+	var i IndexID = 42
+	if i.String() != "0x000000000000002A" {
+		t.Error(i.String())
+	}
+}
+
+func closeAndWait(c Connection, closers ...io.Closer) {
+	for _, closer := range closers {
+		closer.Close()
+	}
+	var raw *rawConnection
+	switch i := c.(type) {
+	case wireFormatConnection:
+		raw = i.Connection.(*rawConnection)
+	case *rawConnection:
+		raw = i
+	}
+	raw.internalClose(ErrClosed)
+	raw.loopWG.Wait()
 }

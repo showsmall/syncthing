@@ -4,12 +4,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//go:generate go run ../../script/protofmt.go database.proto
+//go:generate go run ../../proto/scripts/protofmt.go database.proto
 //go:generate protoc -I ../../ -I . --gogofast_out=. database.proto
 
 package main
 
 import (
+	"context"
+	"log"
 	"sort"
 	"time"
 
@@ -36,7 +38,6 @@ type database interface {
 type levelDBStore struct {
 	db         *leveldb.DB
 	inbox      chan func()
-	stop       chan struct{}
 	clock      clock
 	marshalBuf []byte
 }
@@ -49,7 +50,6 @@ func newLevelDBStore(dir string) (*levelDBStore, error) {
 	return &levelDBStore{
 		db:    db,
 		inbox: make(chan func(), 16),
-		stop:  make(chan struct{}),
 		clock: defaultClock{},
 	}, nil
 }
@@ -154,7 +154,7 @@ func (s *levelDBStore) get(key string) (DatabaseRecord, error) {
 	return rec, nil
 }
 
-func (s *levelDBStore) Serve() {
+func (s *levelDBStore) Serve(ctx context.Context) error {
 	t := time.NewTimer(0)
 	defer t.Stop()
 	defer s.db.Close()
@@ -182,7 +182,7 @@ loop:
 			// the next.
 			t.Reset(databaseStatisticsInterval)
 
-		case <-s.stop:
+		case <-ctx.Done():
 			// We're done.
 			close(statisticsTrigger)
 			break loop
@@ -191,6 +191,8 @@ loop:
 
 	// Also wait for statisticsServe to return
 	<-statisticsDone
+
+	return nil
 }
 
 func (s *levelDBStore) statisticsServe(trigger <-chan struct{}, done chan<- struct{}) {
@@ -254,21 +256,20 @@ func (s *levelDBStore) statisticsServe(trigger <-chan struct{}, done chan<- stru
 	}
 }
 
-func (s *levelDBStore) Stop() {
-	close(s.stop)
-}
-
 // merge returns the merged result of the two database records a and b. The
 // result is the union of the two address sets, with the newer expiry time
 // chosen for any duplicates.
 func merge(a, b DatabaseRecord) DatabaseRecord {
 	// Both lists must be sorted for this to work.
-	sort.Slice(a.Addresses, func(i, j int) bool {
-		return a.Addresses[i].Address < a.Addresses[j].Address
-	})
-	sort.Slice(b.Addresses, func(i, j int) bool {
-		return b.Addresses[i].Address < b.Addresses[j].Address
-	})
+	if !sort.IsSorted(databaseAddressOrder(a.Addresses)) {
+		log.Println("Warning: bug: addresses not correctly sorted in merge")
+		a.Addresses = sortedAddressCopy(a.Addresses)
+	}
+	if !sort.IsSorted(databaseAddressOrder(b.Addresses)) {
+		// no warning because this is the side we read from disk and it may
+		// legitimately predate correct sorting.
+		b.Addresses = sortedAddressCopy(b.Addresses)
+	}
 
 	res := DatabaseRecord{
 		Addresses: make([]DatabaseAddress, 0, len(a.Addresses)+len(b.Addresses)),
@@ -351,4 +352,25 @@ func expire(addrs []DatabaseAddress, now int64) []DatabaseAddress {
 		i++
 	}
 	return addrs
+}
+
+func sortedAddressCopy(addrs []DatabaseAddress) []DatabaseAddress {
+	sorted := make([]DatabaseAddress, len(addrs))
+	copy(sorted, addrs)
+	sort.Sort(databaseAddressOrder(sorted))
+	return sorted
+}
+
+type databaseAddressOrder []DatabaseAddress
+
+func (s databaseAddressOrder) Less(a, b int) bool {
+	return s[a].Address < s[b].Address
+}
+
+func (s databaseAddressOrder) Swap(a, b int) {
+	s[a], s[b] = s[b], s[a]
+}
+
+func (s databaseAddressOrder) Len() int {
+	return len(s)
 }

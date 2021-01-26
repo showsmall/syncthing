@@ -8,9 +8,11 @@ package discover
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -31,19 +33,20 @@ type globalClient struct {
 	queryClient    httpClient
 	noAnnounce     bool
 	noLookup       bool
-	stop           chan struct{}
+	evLogger       events.Logger
 	errorHolder
 }
 
 type httpClient interface {
-	Get(url string) (*http.Response, error)
-	Post(url, ctype string, data io.Reader) (*http.Response, error)
+	Get(ctx context.Context, url string) (*http.Response, error)
+	Post(ctx context.Context, url, ctype string, data io.Reader) (*http.Response, error)
 }
 
 const (
-	defaultReannounceInterval  = 30 * time.Minute
-	announceErrorRetryInterval = 5 * time.Minute
-	requestTimeout             = 5 * time.Second
+	defaultReannounceInterval             = 30 * time.Minute
+	announceErrorRetryInterval            = 5 * time.Minute
+	requestTimeout                        = 5 * time.Second
+	maxAddressChangesBetweenAnnouncements = 10
 )
 
 type announcement struct {
@@ -59,15 +62,17 @@ type serverOptions struct {
 
 // A lookupError is any other error but with a cache validity time attached.
 type lookupError struct {
-	error
+	msg      string
 	cacheFor time.Duration
 }
 
-func (e lookupError) CacheFor() time.Duration {
+func (e *lookupError) Error() string { return e.msg }
+
+func (e *lookupError) CacheFor() time.Duration {
 	return e.cacheFor
 }
 
-func NewGlobal(server string, cert tls.Certificate, addrList AddressLister) (FinderService, error) {
+func NewGlobal(server string, cert tls.Certificate, addrList AddressLister, evLogger events.Logger) (FinderService, error) {
 	server, opts, err := parseOptions(server)
 	if err != nil {
 		return nil, err
@@ -84,33 +89,33 @@ func NewGlobal(server string, cert tls.Certificate, addrList AddressLister) (Fin
 	// The http.Client used for announcements. It needs to have our
 	// certificate to prove our identity, and may or may not verify the server
 	// certificate depending on the insecure setting.
-	var announceClient httpClient = &http.Client{
+	var announceClient httpClient = &contextClient{&http.Client{
 		Timeout: requestTimeout,
 		Transport: &http.Transport{
-			Dial:  dialer.Dial,
-			Proxy: http.ProxyFromEnvironment,
+			DialContext: dialer.DialContextReusePort,
+			Proxy:       http.ProxyFromEnvironment,
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: opts.insecure,
 				Certificates:       []tls.Certificate{cert},
 			},
 		},
-	}
+	}}
 	if opts.id != "" {
 		announceClient = newIDCheckingHTTPClient(announceClient, devID)
 	}
 
 	// The http.Client used for queries. We don't need to present our
 	// certificate here, so lets not include it. May be insecure if requested.
-	var queryClient httpClient = &http.Client{
+	var queryClient httpClient = &contextClient{&http.Client{
 		Timeout: requestTimeout,
 		Transport: &http.Transport{
-			Dial:  dialer.Dial,
-			Proxy: http.ProxyFromEnvironment,
+			DialContext: dialer.DialContext,
+			Proxy:       http.ProxyFromEnvironment,
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: opts.insecure,
 			},
 		},
-	}
+	}}
 	if opts.id != "" {
 		queryClient = newIDCheckingHTTPClient(queryClient, devID)
 	}
@@ -122,7 +127,7 @@ func NewGlobal(server string, cert tls.Certificate, addrList AddressLister) (Fin
 		queryClient:    queryClient,
 		noAnnounce:     opts.noAnnounce,
 		noLookup:       opts.noLookup,
-		stop:           make(chan struct{}),
+		evLogger:       evLogger,
 	}
 	if !opts.noAnnounce {
 		// If we are supposed to annonce, it's an error until we've done so.
@@ -133,10 +138,10 @@ func NewGlobal(server string, cert tls.Certificate, addrList AddressLister) (Fin
 }
 
 // Lookup returns the list of addresses where the given device is available
-func (c *globalClient) Lookup(device protocol.DeviceID) (addresses []string, err error) {
+func (c *globalClient) Lookup(ctx context.Context, device protocol.DeviceID) (addresses []string, err error) {
 	if c.noLookup {
-		return nil, lookupError{
-			error:    errors.New("lookups not supported"),
+		return nil, &lookupError{
+			msg:      "lookups not supported",
 			cacheFor: time.Hour,
 		}
 	}
@@ -150,7 +155,7 @@ func (c *globalClient) Lookup(device protocol.DeviceID) (addresses []string, err
 	q.Set("device", device.String())
 	qURL.RawQuery = q.Encode()
 
-	resp, err := c.queryClient.Get(qURL.String())
+	resp, err := c.queryClient.Get(ctx, qURL.String())
 	if err != nil {
 		l.Debugln("globalClient.Lookup", qURL, err)
 		return nil, err
@@ -160,8 +165,8 @@ func (c *globalClient) Lookup(device protocol.DeviceID) (addresses []string, err
 		l.Debugln("globalClient.Lookup", qURL, resp.Status)
 		err := errors.New(resp.Status)
 		if secs, atoiErr := strconv.Atoi(resp.Header.Get("Retry-After")); atoiErr == nil && secs > 0 {
-			err = lookupError{
-				error:    err,
+			err = &lookupError{
+				msg:      resp.Status,
 				cacheFor: time.Duration(secs) * time.Second,
 			}
 		}
@@ -183,37 +188,50 @@ func (c *globalClient) String() string {
 	return "global@" + c.server
 }
 
-func (c *globalClient) Serve() {
+func (c *globalClient) Serve(ctx context.Context) error {
 	if c.noAnnounce {
 		// We're configured to not do announcements, only lookups. To maintain
 		// the same interface, we just pause here if Serve() is run.
-		<-c.stop
-		return
+		<-ctx.Done()
+		return ctx.Err()
 	}
 
-	timer := time.NewTimer(0)
+	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 
-	eventSub := events.Default.Subscribe(events.ListenAddressesChanged)
-	defer events.Default.Unsubscribe(eventSub)
+	eventSub := c.evLogger.Subscribe(events.ListenAddressesChanged)
+	defer eventSub.Unsubscribe()
+
+	timerResetCount := 0
 
 	for {
 		select {
 		case <-eventSub.C():
-			// Defer announcement by 2 seconds, essentially debouncing
-			// if we have a stream of events incoming in quick succession.
-			timer.Reset(2 * time.Second)
-
+			if timerResetCount < maxAddressChangesBetweenAnnouncements {
+				// Defer announcement by 2 seconds, essentially debouncing
+				// if we have a stream of events incoming in quick succession.
+				timer.Reset(2 * time.Second)
+			} else if timerResetCount == maxAddressChangesBetweenAnnouncements {
+				// Yet only do it if we haven't had to reset maxAddressChangesBetweenAnnouncements times in a row,
+				// so if something is flip-flopping within 2 seconds, we don't end up in a permanent reset loop.
+				l.Warnf("Detected a flip-flopping listener")
+				c.setError(errors.New("flip flopping listener"))
+				// Incrementing the count above 10 will prevent us from warning or setting the error again
+				// It will also suppress event based resets until we've had a proper round after announceErrorRetryInterval
+				timer.Reset(announceErrorRetryInterval)
+			}
+			timerResetCount++
 		case <-timer.C:
-			c.sendAnnouncement(timer)
+			timerResetCount = 0
+			c.sendAnnouncement(ctx, timer)
 
-		case <-c.stop:
-			return
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }
 
-func (c *globalClient) sendAnnouncement(timer *time.Timer) {
+func (c *globalClient) sendAnnouncement(ctx context.Context, timer *time.Timer) {
 	var ann announcement
 	if c.addrList != nil {
 		ann.Addresses = c.addrList.ExternalAddresses()
@@ -231,27 +249,27 @@ func (c *globalClient) sendAnnouncement(timer *time.Timer) {
 	// The marshal doesn't fail, I promise.
 	postData, _ := json.Marshal(ann)
 
-	l.Debugf("Announcement: %s", postData)
+	l.Debugf("%s Announcement: %v", c, ann)
 
-	resp, err := c.announceClient.Post(c.server, "application/json", bytes.NewReader(postData))
+	resp, err := c.announceClient.Post(ctx, c.server, "application/json", bytes.NewReader(postData))
 	if err != nil {
-		l.Debugln("announce POST:", err)
+		l.Debugln(c, "announce POST:", err)
 		c.setError(err)
 		timer.Reset(announceErrorRetryInterval)
 		return
 	}
-	l.Debugln("announce POST:", resp.Status)
+	l.Debugln(c, "announce POST:", resp.Status)
 	resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		l.Debugln("announce POST:", resp.Status)
+		l.Debugln(c, "announce POST:", resp.Status)
 		c.setError(errors.New(resp.Status))
 
 		if h := resp.Header.Get("Retry-After"); h != "" {
 			// The server has a recommendation on when we should
 			// retry. Follow it.
 			if secs, err := strconv.Atoi(h); err == nil && secs > 0 {
-				l.Debugln("announce Retry-After:", secs, err)
+				l.Debugln(c, "announce Retry-After:", secs, err)
 				timer.Reset(time.Duration(secs) * time.Second)
 				return
 			}
@@ -267,17 +285,13 @@ func (c *globalClient) sendAnnouncement(timer *time.Timer) {
 		// The server has a recommendation on when we should
 		// reannounce. Follow it.
 		if secs, err := strconv.Atoi(h); err == nil && secs > 0 {
-			l.Debugln("announce Reannounce-After:", secs, err)
+			l.Debugln(c, "announce Reannounce-After:", secs, err)
 			timer.Reset(time.Duration(secs) * time.Second)
 			return
 		}
 	}
 
 	timer.Reset(defaultReannounceInterval)
-}
-
-func (c *globalClient) Stop() {
-	close(c.stop)
 }
 
 func (c *globalClient) Cache() map[protocol.DeviceID]CacheEntry {
@@ -360,8 +374,8 @@ func (c *idCheckingHTTPClient) check(resp *http.Response) error {
 	return nil
 }
 
-func (c *idCheckingHTTPClient) Get(url string) (*http.Response, error) {
-	resp, err := c.httpClient.Get(url)
+func (c *idCheckingHTTPClient) Get(ctx context.Context, url string) (*http.Response, error) {
+	resp, err := c.httpClient.Get(ctx, url)
 	if err != nil {
 		return nil, err
 	}
@@ -372,8 +386,8 @@ func (c *idCheckingHTTPClient) Get(url string) (*http.Response, error) {
 	return resp, nil
 }
 
-func (c *idCheckingHTTPClient) Post(url, ctype string, data io.Reader) (*http.Response, error) {
-	resp, err := c.httpClient.Post(url, ctype, data)
+func (c *idCheckingHTTPClient) Post(ctx context.Context, url, ctype string, data io.Reader) (*http.Response, error) {
+	resp, err := c.httpClient.Post(ctx, url, ctype, data)
 	if err != nil {
 		return nil, err
 	}
@@ -400,4 +414,45 @@ func (e *errorHolder) Error() error {
 	err := e.err
 	e.mut.Unlock()
 	return err
+}
+
+type contextClient struct {
+	*http.Client
+}
+
+func (c *contextClient) Get(ctx context.Context, url string) (*http.Response, error) {
+	// For <go1.13 compatibility. Use the following commented line once that
+	// isn't required anymore.
+	// req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Cancel = ctx.Done()
+	return c.Client.Do(req)
+}
+
+func (c *contextClient) Post(ctx context.Context, url, ctype string, data io.Reader) (*http.Response, error) {
+	// For <go1.13 compatibility. Use the following commented line once that
+	// isn't required anymore.
+	// req, err := http.NewRequestWithContext(ctx, "POST", url, data)
+	req, err := http.NewRequest("POST", url, data)
+	if err != nil {
+		return nil, err
+	}
+	req.Cancel = ctx.Done()
+	req.Header.Set("Content-Type", ctype)
+	return c.Client.Do(req)
+}
+
+func globalDiscoveryIdentity(addr string) string {
+	return "global discovery server " + addr
+}
+
+func ipv4Identity(port int) string {
+	return fmt.Sprintf("IPv4 local broadcast discovery on port %d", port)
+}
+
+func ipv6Identity(addr string) string {
+	return fmt.Sprintf("IPv6 local multicast discovery on address %s", addr)
 }

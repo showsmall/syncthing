@@ -2,7 +2,6 @@
 
 ---
 
-[![Latest Downloads](https://img.shields.io/badge/latest-downloads-brightgreen.svg?style=flat-square)](https://build.syncthing.net/latest/)
 [![Latest Linux & Cross Build](https://img.shields.io/teamcity/https/build.syncthing.net/s/Syncthing_BuildLinuxCross.svg?style=flat-square&label=linux+%26+cross+build)](https://build.syncthing.net/viewType.html?buildTypeId=Syncthing_BuildLinuxCross&guest=1)
 [![Latest Windows Build](https://img.shields.io/teamcity/https/build.syncthing.net/s/Syncthing_BuildWindows.svg?style=flat-square&label=windows+build)](https://build.syncthing.net/viewType.html?buildTypeId=Syncthing_BuildWindows&guest=1)
 [![Latest Mac Build](https://img.shields.io/teamcity/https/build.syncthing.net/s/Syncthing_BuildMac.svg?style=flat-square&label=mac+build)](https://build.syncthing.net/viewType.html?buildTypeId=Syncthing_BuildMac&guest=1)
@@ -63,6 +62,10 @@ There are a few examples for keeping Syncthing running in the background
 on your system in [the etc directory][3]. There are also several [GUI
 implementations][11] for Windows, Mac and Linux.
 
+## Docker
+
+To run Syncthing in Docker, see [the Docker README][16].
+
 ## Vote on features/bugs
 
 We'd like to encourage you to [vote][12] on issues that matter to you.
@@ -98,17 +101,18 @@ All code is licensed under the [MPLv2 License][7].
 
 [1]: https://docs.syncthing.net/specs/bep-v1.html
 [2]: https://docs.syncthing.net/intro/getting-started.html
-[3]: https://github.com/syncthing/syncthing/blob/master/etc
+[3]: https://github.com/syncthing/syncthing/blob/main/etc
 [4]: https://www.freenode.net/
 [5]: https://docs.syncthing.net/dev/building.html
 [6]: https://docs.syncthing.net/
-[7]: https://github.com/syncthing/syncthing/blob/master/LICENSE
+[7]: https://github.com/syncthing/syncthing/blob/main/LICENSE
 [8]: https://forum.syncthing.net/
 [9]: https://kiwiirc.com/client/irc.freenode.net/#syncthing
 [10]: https://github.com/syncthing/syncthing/issues
 [11]: https://docs.syncthing.net/users/contrib.html#gui-wrappers
 [12]: https://www.bountysource.com/teams/syncthing/issues
-[13]: https://github.com/syncthing/syncthing/blob/master/GOALS.md
+[13]: https://github.com/syncthing/syncthing/blob/main/GOALS.md
 [14]: assets/logo-text-128.png
 [15]: https://syncthing.net/
+[16]: https://github.com/syncthing/syncthing/blob/main/README-Docker.md
 

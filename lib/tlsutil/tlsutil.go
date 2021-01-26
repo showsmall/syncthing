@@ -14,17 +14,18 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"fmt"
 	"math/big"
 	"net"
 	"os"
 	"time"
 
+	"github.com/pkg/errors"
+
 	"github.com/syncthing/syncthing/lib/rand"
 )
 
 var (
-	ErrIdentificationFailed = fmt.Errorf("failed to identify socket type")
+	ErrIdentificationFailed = errors.New("failed to identify socket type")
 )
 
 var (
@@ -80,11 +81,7 @@ func SecureDefault() *tls.Config {
 	return &tls.Config{
 		// TLS 1.2 is the minimum we accept
 		MinVersion: tls.VersionTLS12,
-		// We want the longer curves at the front, because that's more
-		// secure (so the web tells me, don't ask me to explain the
-		// details).
-		CurvePreferences: []tls.CurveID{tls.CurveP521, tls.CurveP384, tls.CurveP256},
-		// The cipher suite lists built above.
+		// The cipher suite lists built above. These are ignored in TLS 1.3.
 		CipherSuites: cs,
 		// We've put some thought into this choice and would like it to
 		// matter.
@@ -93,20 +90,26 @@ func SecureDefault() *tls.Config {
 }
 
 // NewCertificate generates and returns a new TLS certificate.
-func NewCertificate(certFile, keyFile, commonName string) (tls.Certificate, error) {
+func NewCertificate(certFile, keyFile, commonName string, lifetimeDays int) (tls.Certificate, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("generate key: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "generate key")
 	}
 
-	notBefore := time.Now()
-	notAfter := time.Date(2049, 12, 31, 23, 59, 59, 0, time.UTC)
+	notBefore := time.Now().Truncate(24 * time.Hour)
+	notAfter := notBefore.Add(time.Duration(lifetimeDays*24) * time.Hour)
 
+	// NOTE: update lib/api.shouldRegenerateCertificate() appropriately if
+	// you add or change attributes in here, especially DNSNames or
+	// IPAddresses.
 	template := x509.Certificate{
-		SerialNumber: new(big.Int).SetInt64(rand.Int63()),
+		SerialNumber: new(big.Int).SetUint64(rand.Uint64()),
 		Subject: pkix.Name{
-			CommonName: commonName,
+			CommonName:         commonName,
+			Organization:       []string{"Syncthing"},
+			OrganizationalUnit: []string{"Automatically Generated"},
 		},
+		DNSNames:              []string{commonName},
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		SignatureAlgorithm:    x509.ECDSAWithSHA256,
@@ -117,39 +120,39 @@ func NewCertificate(certFile, keyFile, commonName string) (tls.Certificate, erro
 
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, publicKey(priv), priv)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("create cert: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "create cert")
 	}
 
 	certOut, err := os.Create(certFile)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("save cert: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "save cert")
 	}
 	err = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("save cert: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "save cert")
 	}
 	err = certOut.Close()
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("save cert: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "save cert")
 	}
 
 	keyOut, err := os.OpenFile(keyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("save key: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "save key")
 	}
 
 	block, err := pemBlockForKey(priv)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("save key: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "save key")
 	}
 
 	err = pem.Encode(keyOut, block)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("save key: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "save key")
 	}
 	err = keyOut.Close()
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("save key: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "save key")
 	}
 
 	return tls.LoadX509KeyPair(certFile, keyFile)
@@ -239,7 +242,7 @@ func pemBlockForKey(priv interface{}) (*pem.Block, error) {
 		}
 		return &pem.Block{Type: "EC PRIVATE KEY", Bytes: b}, nil
 	default:
-		return nil, fmt.Errorf("unknown key type")
+		return nil, errors.New("unknown key type")
 	}
 }
 

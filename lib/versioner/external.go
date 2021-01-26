@@ -7,12 +7,15 @@
 package versioner
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
+	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/fs"
 
 	"github.com/kballard/go-shellquote"
@@ -20,24 +23,24 @@ import (
 
 func init() {
 	// Register the constructor for this type of versioner with the name "external"
-	Factories["external"] = NewExternal
+	factories["external"] = newExternal
 }
 
-type External struct {
+type external struct {
 	command    string
 	filesystem fs.Filesystem
 }
 
-func NewExternal(folderID string, filesystem fs.Filesystem, params map[string]string) Versioner {
-	command := params["command"]
+func newExternal(cfg config.FolderConfiguration) Versioner {
+	command := cfg.Versioning.Params["command"]
 
 	if runtime.GOOS == "windows" {
 		command = strings.Replace(command, `\`, `\\`, -1)
 	}
 
-	s := External{
+	s := external{
 		command:    command,
-		filesystem: filesystem,
+		filesystem: cfg.Filesystem(),
 	}
 
 	l.Debugf("instantiated %#v", s)
@@ -46,7 +49,7 @@ func NewExternal(folderID string, filesystem fs.Filesystem, params map[string]st
 
 // Archive moves the named file away to a version archive. If this function
 // returns nil, the named file does not exist any more (has been archived).
-func (v External) Archive(filePath string) error {
+func (v external) Archive(filePath string) error {
 	info, err := v.filesystem.Lstat(filePath)
 	if fs.IsNotExist(err) {
 		l.Debugln("not archiving nonexistent file", filePath)
@@ -76,9 +79,11 @@ func (v External) Archive(filePath string) error {
 	}
 
 	for i, word := range words {
-		if replacement, ok := context[word]; ok {
-			words[i] = replacement
+		for key, val := range context {
+			word = strings.Replace(word, key, val, -1)
 		}
+
+		words[i] = word
 	}
 
 	cmd := exec.Command(words[0], words[1:]...)
@@ -102,4 +107,16 @@ func (v External) Archive(filePath string) error {
 		return nil
 	}
 	return errors.New("Versioner: file was not removed by external script")
+}
+
+func (v external) GetVersions() (map[string][]FileVersion, error) {
+	return nil, ErrRestorationNotSupported
+}
+
+func (v external) Restore(filePath string, versionTime time.Time) error {
+	return ErrRestorationNotSupported
+}
+
+func (v external) Clean(_ context.Context) error {
+	return nil
 }

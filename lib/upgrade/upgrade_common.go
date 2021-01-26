@@ -21,15 +21,22 @@ type Release struct {
 	Tag        string  `json:"tag_name"`
 	Prerelease bool    `json:"prerelease"`
 	Assets     []Asset `json:"assets"`
+
+	// The HTML URL is needed for human readable links in the output created
+	// by cmd/stupgrades.
+	HTMLURL string `json:"html_url"`
 }
 
 type Asset struct {
 	URL  string `json:"url"`
 	Name string `json:"name"`
+
+	// The browser URL is needed for human readable links in the output created
+	// by cmd/stupgrades.
+	BrowserURL string `json:"browser_download_url"`
 }
 
 var (
-	ErrVersionUpToDate    = errors.New("current version is up to date")
 	ErrNoReleaseDownload  = errors.New("couldn't find a release to download")
 	ErrNoVersionToSelect  = errors.New("no version to select")
 	ErrUpgradeUnsupported = errors.New("upgrade unsupported")
@@ -83,10 +90,10 @@ type Relation int
 
 const (
 	MajorOlder Relation = -2 // Older by a major version (x in x.y.z or 0.x.y).
-	Older               = -1 // Older by a minor version (y or z in x.y.z, or y in 0.x.y)
-	Equal               = 0  // Versions are semantically equal
-	Newer               = 1  // Newer by a minor version (y or z in x.y.z, or y in 0.x.y)
-	MajorNewer          = 2  // Newer by a major version (x in x.y.z or 0.x.y).
+	Older      Relation = -1 // Older by a minor version (y or z in x.y.z, or y in 0.x.y)
+	Equal      Relation = 0  // Versions are semantically equal
+	Newer      Relation = 1  // Newer by a minor version (y or z in x.y.z, or y in 0.x.y)
+	MajorNewer Relation = 2  // Newer by a major version (x in x.y.z or 0.x.y).
 )
 
 // CompareVersions returns a relation describing how a compares to b.

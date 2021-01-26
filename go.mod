@@ -1,52 +1,51 @@
 module github.com/syncthing/syncthing
 
 require (
-	github.com/AudriusButkevicius/cli v0.0.0-20140727204646-7f561c78b5a4
-	github.com/AudriusButkevicius/go-nat-pmp v0.0.0-20160522074932-452c97607362
-	github.com/beorn7/perks v0.0.0-20160804104726-4c0e84591b9a // indirect
+	github.com/AudriusButkevicius/pfilter v0.0.0-20190627213056-c55ef6137fc6
+	github.com/AudriusButkevicius/recli v0.0.5
 	github.com/bkaradzic/go-lz4 v0.0.0-20160924222819-7224d8d8f27e
-	github.com/calmh/du v1.0.1
 	github.com/calmh/xdr v1.1.0
+	github.com/ccding/go-stun v0.1.2
+	github.com/certifi/gocertifi v0.0.0-20200922220541-2c3bb06c6054 // indirect
 	github.com/chmduquesne/rollinghash v0.0.0-20180912150627-a60f8e7142b5
 	github.com/d4l3k/messagediff v1.2.1
-	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/gobwas/glob v0.0.0-20170212200151-51eb1ee00b6d
-	github.com/gogo/protobuf v1.0.0
-	github.com/golang/groupcache v0.0.0-20171101203131-84a468cf14b4
-	github.com/golang/protobuf v0.0.0-20171113180720-1e59b77b52bf // indirect
-	github.com/golang/snappy v0.0.0-20170215233205-553a64147049 // indirect
-	github.com/jackpal/gateway v0.0.0-20161225004348-5795ac81146e
-	github.com/kballard/go-shellquote v0.0.0-20170619183022-cd60e84ee657
-	github.com/kr/pretty v0.1.0 // indirect
-	github.com/lib/pq v1.0.0
-	github.com/matttproud/golang_protobuf_extensions v1.0.1 // indirect
-	github.com/minio/sha256-simd v0.0.0-20171213220625-ad98a36ba0da
-	github.com/onsi/ginkgo v0.0.0-20171221013426-6c46eb8334b3 // indirect
-	github.com/onsi/gomega v0.0.0-20171227184521-ba3724c94e4d // indirect
-	github.com/oschwald/geoip2-golang v1.1.0
-	github.com/oschwald/maxminddb-golang v0.0.0-20170901134056-26fe5ace1c70 // indirect
-	github.com/petermattis/goid v0.0.0-20170816195418-3db12ebb2a59 // indirect
-	github.com/pkg/errors v0.0.0-20171216070316-e881fd58d78e
-	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/prometheus/client_golang v0.9.0
-	github.com/prometheus/client_model v0.0.0-20171117100541-99fa1f4be8e5 // indirect
-	github.com/prometheus/common v0.0.0-20171117163051-2e54d0b93cba // indirect
-	github.com/prometheus/procfs v0.0.0-20171226183907-b15cd069a834 // indirect
-	github.com/rcrowley/go-metrics v0.0.0-20171128170426-e181e095bae9
+	github.com/dchest/siphash v1.2.2
+	github.com/dgraph-io/badger/v2 v2.0.3
+	github.com/flynn-archive/go-shlex v0.0.0-20150515145356-3f9db97f8568
+	github.com/getsentry/raven-go v0.2.0
+	github.com/go-ldap/ldap/v3 v3.2.4
+	github.com/gobwas/glob v0.2.3
+	github.com/gogo/protobuf v1.3.1
+	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e
+	github.com/greatroar/blobloom v0.5.0
+	github.com/jackpal/gateway v1.0.6
+	github.com/jackpal/go-nat-pmp v1.0.2
+	github.com/julienschmidt/httprouter v1.3.0
+	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
+	github.com/lib/pq v1.8.0
+	github.com/lucas-clemente/quic-go v0.19.3
+	github.com/maruel/panicparse v1.5.1
+	github.com/mattn/go-isatty v0.0.12
+	github.com/minio/sha256-simd v0.1.1
+	github.com/miscreant/miscreant.go v0.0.0-20200214223636-26d376326b75
+	github.com/oschwald/geoip2-golang v1.4.0
+	github.com/petermattis/goid v0.0.0-20180202154549-b0b1615b78e5 // indirect
+	github.com/pkg/errors v0.9.1
+	github.com/prometheus/client_golang v1.8.0
+	github.com/rcrowley/go-metrics v0.0.0-20200313005456-10cdbea86bc0
 	github.com/sasha-s/go-deadlock v0.2.0
-	github.com/stretchr/testify v1.2.2 // indirect
-	github.com/syncthing/notify v0.0.0-20181107104724-4e389ea6c0d8
-	github.com/syndtr/goleveldb v0.0.0-20171214120811-34011bf325bc
-	github.com/thejerf/suture v0.0.0-20180907184608-bf6ee6a0b047
+	github.com/shirou/gopsutil/v3 v3.20.11
+	github.com/syncthing/notify v0.0.0-20201210100135-17de26665ddc
+	github.com/syndtr/goleveldb v1.0.1-0.20200815071216-d9e9293bd0f7
+	github.com/thejerf/suture/v4 v4.0.0
+	github.com/urfave/cli v1.22.4
 	github.com/vitrun/qart v0.0.0-20160531060029-bf64b92db6b0
-	golang.org/x/crypto v0.0.0-20171231215028-0fcca4842a8d
-	golang.org/x/net v0.0.0-20171212005608-d866cfc389ce
-	golang.org/x/sync v0.0.0-20181108010431-42b317875d0f // indirect
-	golang.org/x/sys v0.0.0-20181213200352-4d1cda033e06 // indirect
-	golang.org/x/text v0.0.0-20171227012246-e19ae1496984
-	golang.org/x/time v0.0.0-20170927054726-6dc17368e09b
-	gopkg.in/asn1-ber.v1 v1.0.0-20170511165959-379148ca0225 // indirect
-	gopkg.in/check.v1 v1.0.0-20180628173108-788fd7840127 // indirect
-	gopkg.in/ldap.v2 v2.5.1
-	gopkg.in/yaml.v2 v2.0.0-20171116090243-287cf08546ab // indirect
+	golang.org/x/crypto v0.0.0-20201016220609-9e8e0b390897
+	golang.org/x/net v0.0.0-20201031054903-ff519b6c9102
+	golang.org/x/sys v0.0.0-20201101102859-da207088b7d1
+	golang.org/x/text v0.3.4
+	golang.org/x/time v0.0.0-20200630173020-3af7569d3a1e
+	google.golang.org/protobuf v1.23.0
 )
+
+go 1.14

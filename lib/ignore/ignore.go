@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gobwas/glob"
+
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/sync"
@@ -29,6 +31,41 @@ const (
 	resultDeletable         = 1 << iota
 	resultFoldCase          = 1 << iota
 )
+
+var defaultResult Result = resultInclude
+
+func init() {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		defaultResult |= resultFoldCase
+	}
+}
+
+// A ParseError signifies an error with contents of an ignore file,
+// including I/O errors on included files. An I/O error on the root level
+// ignore file is not a ParseError.
+type ParseError struct {
+	inner error
+}
+
+func (e *ParseError) Error() string {
+	return fmt.Sprintf("parse error: %v", e.inner)
+}
+
+func (e *ParseError) Unwrap() error {
+	return e.inner
+}
+
+func IsParseError(err error) bool {
+	var e *ParseError
+	return errors.As(err, &e)
+}
+
+func parseError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &ParseError{err}
+}
 
 type Pattern struct {
 	pattern string
@@ -48,6 +85,20 @@ func (p Pattern) String() string {
 		ret = "(?d)" + ret
 	}
 	return ret
+}
+
+func (p Pattern) allowsSkippingIgnoredDirs() bool {
+	if p.result.IsIgnored() {
+		return true
+	}
+	if p.pattern[0] != '/' {
+		return false
+	}
+	if strings.Contains(p.pattern[1:], "/") {
+		return false
+	}
+	// Double asterisk everywhere in the path except at the end is bad
+	return !strings.Contains(strings.TrimSuffix(p.pattern, "**"), "**")
 }
 
 type Result uint8
@@ -126,6 +177,10 @@ func New(fs fs.Filesystem, opts ...Option) *Matcher {
 	return m
 }
 
+// Load and parse a file. The returned error may be of type *ParseError in
+// which case a file was loaded from disk but the patterns could not be
+// parsed. In this case the contents of the file are nonetheless available
+// in the Lines() method.
 func (m *Matcher) Load(file string) error {
 	m.mut.Lock()
 	defer m.mut.Unlock()
@@ -152,6 +207,7 @@ func (m *Matcher) Load(file string) error {
 	return err
 }
 
+// Load and parse an io.Reader. See Load() for notes on the returned error.
 func (m *Matcher) Parse(r io.Reader, file string) error {
 	m.mut.Lock()
 	defer m.mut.Unlock()
@@ -172,11 +228,20 @@ func (m *Matcher) parseLocked(r io.Reader, file string) error {
 	}
 
 	m.skipIgnoredDirs = true
+	var previous string
 	for _, p := range patterns {
-		if !p.result.IsIgnored() {
+		// We automatically add patterns with a /** suffix, which normally
+		// means that we cannot skip directories. However if the same
+		// pattern without the /** already exists (which is true for
+		// automatically added patterns) we can skip.
+		if l := len(p.pattern); l > 3 && p.pattern[:len(p.pattern)-3] == previous {
+			continue
+		}
+		if !p.allowsSkippingIgnoredDirs() {
 			m.skipIgnoredDirs = false
 			break
 		}
+		previous = p.pattern
 	}
 
 	m.curHash = newHash
@@ -343,7 +408,7 @@ func loadParseIncludeFile(filesystem fs.Filesystem, file string, cd ChangeDetect
 	}
 
 	if cd.Seen(filesystem, file) {
-		return nil, fmt.Errorf("multiple include of ignore file %q", file)
+		return nil, parseError(fmt.Errorf("multiple include of ignore file %q", file))
 	}
 
 	fd, info, err := loadIgnoreFile(filesystem, file, cd)
@@ -358,95 +423,108 @@ func loadParseIncludeFile(filesystem fs.Filesystem, file string, cd ChangeDetect
 	return patterns, err
 }
 
-func parseIgnoreFile(fs fs.Filesystem, fd io.Reader, currentFile string, cd ChangeDetector, linesSeen map[string]struct{}) ([]string, []Pattern, error) {
-	var lines []string
-	var patterns []Pattern
-
-	defaultResult := resultInclude
-	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
-		defaultResult |= resultFoldCase
+func parseLine(line string) ([]Pattern, error) {
+	pattern := Pattern{
+		result: defaultResult,
 	}
 
-	addPattern := func(line string) error {
-		pattern := Pattern{
-			result: defaultResult,
-		}
+	// Allow prefixes to be specified in any order, but only once.
+	var seenPrefix [3]bool
 
-		// Allow prefixes to be specified in any order, but only once.
-		var seenPrefix [3]bool
-
-		for {
-			if strings.HasPrefix(line, "!") && !seenPrefix[0] {
-				seenPrefix[0] = true
-				line = line[1:]
-				pattern.result ^= resultInclude
-			} else if strings.HasPrefix(line, "(?i)") && !seenPrefix[1] {
-				seenPrefix[1] = true
-				pattern.result |= resultFoldCase
-				line = line[4:]
-			} else if strings.HasPrefix(line, "(?d)") && !seenPrefix[2] {
-				seenPrefix[2] = true
-				pattern.result |= resultDeletable
-				line = line[4:]
-			} else {
-				break
-			}
-		}
-
-		if pattern.result.IsCaseFolded() {
-			line = strings.ToLower(line)
-		}
-
-		pattern.pattern = line
-
-		var err error
-		if strings.HasPrefix(line, "/") {
-			// Pattern is rooted in the current dir only
-			pattern.match, err = glob.Compile(line[1:], '/')
-			if err != nil {
-				return fmt.Errorf("invalid pattern %q in ignore file (%v)", line, err)
-			}
-			patterns = append(patterns, pattern)
-		} else if strings.HasPrefix(line, "**/") {
-			// Add the pattern as is, and without **/ so it matches in current dir
-			pattern.match, err = glob.Compile(line, '/')
-			if err != nil {
-				return fmt.Errorf("invalid pattern %q in ignore file (%v)", line, err)
-			}
-			patterns = append(patterns, pattern)
-
-			line = line[3:]
-			pattern.pattern = line
-			pattern.match, err = glob.Compile(line, '/')
-			if err != nil {
-				return fmt.Errorf("invalid pattern %q in ignore file (%v)", line, err)
-			}
-			patterns = append(patterns, pattern)
+	for {
+		if strings.HasPrefix(line, "!") && !seenPrefix[0] {
+			seenPrefix[0] = true
+			line = line[1:]
+			pattern.result ^= resultInclude
+		} else if strings.HasPrefix(line, "(?i)") && !seenPrefix[1] {
+			seenPrefix[1] = true
+			pattern.result |= resultFoldCase
+			line = line[4:]
+		} else if strings.HasPrefix(line, "(?d)") && !seenPrefix[2] {
+			seenPrefix[2] = true
+			pattern.result |= resultDeletable
+			line = line[4:]
 		} else {
-			// Path name or pattern, add it so it matches files both in
-			// current directory and subdirs.
-			pattern.match, err = glob.Compile(line, '/')
-			if err != nil {
-				return fmt.Errorf("invalid pattern %q in ignore file (%v)", line, err)
-			}
-			patterns = append(patterns, pattern)
-
-			line := "**/" + line
-			pattern.pattern = line
-			pattern.match, err = glob.Compile(line, '/')
-			if err != nil {
-				return fmt.Errorf("invalid pattern %q in ignore file (%v)", line, err)
-			}
-			patterns = append(patterns, pattern)
+			break
 		}
+	}
+
+	if line == "" {
+		return nil, parseError(errors.New("missing pattern"))
+	}
+
+	if pattern.result.IsCaseFolded() {
+		line = strings.ToLower(line)
+	}
+
+	pattern.pattern = line
+
+	var err error
+	if strings.HasPrefix(line, "/") {
+		// Pattern is rooted in the current dir only
+		pattern.match, err = glob.Compile(line[1:], '/')
+		return []Pattern{pattern}, parseError(err)
+	}
+	patterns := make([]Pattern, 2)
+	if strings.HasPrefix(line, "**/") {
+		// Add the pattern as is, and without **/ so it matches in current dir
+		pattern.match, err = glob.Compile(line, '/')
+		if err != nil {
+			return nil, parseError(err)
+		}
+		patterns[0] = pattern
+
+		line = line[3:]
+		pattern.pattern = line
+		pattern.match, err = glob.Compile(line, '/')
+		if err != nil {
+			return nil, parseError(err)
+		}
+		patterns[1] = pattern
+		return patterns, nil
+	}
+	// Path name or pattern, add it so it matches files both in
+	// current directory and subdirs.
+	pattern.match, err = glob.Compile(line, '/')
+	if err != nil {
+		return nil, parseError(err)
+	}
+	patterns[0] = pattern
+
+	line = "**/" + line
+	pattern.pattern = line
+	pattern.match, err = glob.Compile(line, '/')
+	if err != nil {
+		return nil, parseError(err)
+	}
+	patterns[1] = pattern
+	return patterns, nil
+}
+
+func parseIgnoreFile(fs fs.Filesystem, fd io.Reader, currentFile string, cd ChangeDetector, linesSeen map[string]struct{}) ([]string, []Pattern, error) {
+	var patterns []Pattern
+
+	addPattern := func(line string) error {
+		newPatterns, err := parseLine(line)
+		if err != nil {
+			return fmt.Errorf("invalid pattern %q in ignore file: %w", line, err)
+		}
+		patterns = append(patterns, newPatterns...)
 		return nil
 	}
 
 	scanner := bufio.NewScanner(fd)
-	var err error
+	var lines []string
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		lines = append(lines, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	var err error
+	for _, line := range lines {
 		if _, ok := linesSeen[line]; ok {
 			continue
 		}
@@ -461,7 +539,18 @@ func parseIgnoreFile(fs fs.Filesystem, fd io.Reader, currentFile string, cd Chan
 		line = filepath.ToSlash(line)
 		switch {
 		case strings.HasPrefix(line, "#include"):
-			includeRel := strings.TrimSpace(line[len("#include "):])
+			fields := strings.SplitN(line, " ", 2)
+			if len(fields) != 2 {
+				err = parseError(errors.New("failed to parse #include line: no file?"))
+				break
+			}
+
+			includeRel := strings.TrimSpace(fields[1])
+			if includeRel == "" {
+				err = parseError(errors.New("failed to parse #include line: no file?"))
+				break
+			}
+
 			includeFile := filepath.Join(filepath.Dir(currentFile), includeRel)
 			var includePatterns []Pattern
 			if includePatterns, err = loadParseIncludeFile(fs, includeFile, cd, linesSeen); err == nil {
@@ -471,7 +560,7 @@ func parseIgnoreFile(fs fs.Filesystem, fd io.Reader, currentFile string, cd Chan
 				// IsNotExists(err) == true error, which we use to check
 				// existance of the .stignore file, and just end up assuming
 				// there is none, rather than a broken include.
-				err = fmt.Errorf("failed to load include file %s: %s", includeFile, err.Error())
+				err = parseError(fmt.Errorf("failed to load include file %s: %w", includeFile, err))
 			}
 		case strings.HasSuffix(line, "/**"):
 			err = addPattern(line)
@@ -484,7 +573,7 @@ func parseIgnoreFile(fs fs.Filesystem, fd io.Reader, currentFile string, cd Chan
 			}
 		}
 		if err != nil {
-			return nil, nil, err
+			return lines, nil, err
 		}
 	}
 
@@ -493,6 +582,14 @@ func parseIgnoreFile(fs fs.Filesystem, fd io.Reader, currentFile string, cd Chan
 
 // WriteIgnores is a convenience function to avoid code duplication
 func WriteIgnores(filesystem fs.Filesystem, path string, content []string) error {
+	if len(content) == 0 {
+		err := filesystem.Remove(path)
+		if fs.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
 	fd, err := osutil.CreateAtomicFilesystem(filesystem, path)
 	if err != nil {
 		return err

@@ -10,32 +10,17 @@ import (
 	"sort"
 
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/util"
 )
-
-type DeviceConfiguration struct {
-	DeviceID                 protocol.DeviceID    `xml:"id,attr" json:"deviceID"`
-	Name                     string               `xml:"name,attr,omitempty" json:"name"`
-	Addresses                []string             `xml:"address,omitempty" json:"addresses"`
-	Compression              protocol.Compression `xml:"compression,attr" json:"compression"`
-	CertName                 string               `xml:"certName,attr,omitempty" json:"certName"`
-	Introducer               bool                 `xml:"introducer,attr" json:"introducer"`
-	SkipIntroductionRemovals bool                 `xml:"skipIntroductionRemovals,attr" json:"skipIntroductionRemovals"`
-	IntroducedBy             protocol.DeviceID    `xml:"introducedBy,attr" json:"introducedBy"`
-	Paused                   bool                 `xml:"paused" json:"paused"`
-	AllowedNetworks          []string             `xml:"allowedNetwork,omitempty" json:"allowedNetworks"`
-	AutoAcceptFolders        bool                 `xml:"autoAcceptFolders" json:"autoAcceptFolders"`
-	MaxSendKbps              int                  `xml:"maxSendKbps" json:"maxSendKbps"`
-	MaxRecvKbps              int                  `xml:"maxRecvKbps" json:"maxRecvKbps"`
-	IgnoredFolders           []ObservedFolder     `xml:"ignoredFolder" json:"ignoredFolders"`
-	PendingFolders           []ObservedFolder     `xml:"pendingFolder" json:"pendingFolders"`
-	MaxRequestKiB            int                  `xml:"maxRequestKiB" json:"maxRequestKiB"`
-}
 
 func NewDeviceConfiguration(id protocol.DeviceID, name string) DeviceConfiguration {
 	d := DeviceConfiguration{
 		DeviceID: id,
 		Name:     name,
 	}
+
+	util.SetDefaults(&d)
+
 	d.prepare(nil)
 	return d
 }
@@ -48,8 +33,6 @@ func (cfg DeviceConfiguration) Copy() DeviceConfiguration {
 	copy(c.AllowedNetworks, cfg.AllowedNetworks)
 	c.IgnoredFolders = make([]ObservedFolder, len(cfg.IgnoredFolders))
 	copy(c.IgnoredFolders, cfg.IgnoredFolders)
-	c.PendingFolders = make([]ObservedFolder, len(cfg.PendingFolders))
-	copy(c.PendingFolders, cfg.PendingFolders)
 	return c
 }
 
@@ -62,19 +45,12 @@ func (cfg *DeviceConfiguration) prepare(sharedFolders []string) {
 	}
 
 	ignoredFolders := deduplicateObservedFoldersToMap(cfg.IgnoredFolders)
-	pendingFolders := deduplicateObservedFoldersToMap(cfg.PendingFolders)
-
-	for id := range ignoredFolders {
-		delete(pendingFolders, id)
-	}
 
 	for _, sharedFolder := range sharedFolders {
 		delete(ignoredFolders, sharedFolder)
-		delete(pendingFolders, sharedFolder)
 	}
 
 	cfg.IgnoredFolders = sortedObservedFolderSlice(ignoredFolders)
-	cfg.PendingFolders = sortedObservedFolderSlice(pendingFolders)
 }
 
 func (cfg *DeviceConfiguration) IgnoredFolder(folder string) bool {

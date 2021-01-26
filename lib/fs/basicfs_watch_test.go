@@ -57,7 +57,8 @@ func TestMain(m *testing.M) {
 }
 
 const (
-	testDir = "testdata"
+	testDir        = "testdata"
+	failsOnOpenBSD = "Fails on OpenBSD. See https://github.com/rjeczalik/notify/issues/172"
 )
 
 var (
@@ -66,6 +67,9 @@ var (
 )
 
 func TestWatchIgnore(t *testing.T) {
+	if runtime.GOOS == "openbsd" {
+		t.Skip(failsOnOpenBSD)
+	}
 	name := "ignore"
 
 	file := "file"
@@ -87,6 +91,9 @@ func TestWatchIgnore(t *testing.T) {
 }
 
 func TestWatchInclude(t *testing.T) {
+	if runtime.GOOS == "openbsd" {
+		t.Skip(failsOnOpenBSD)
+	}
 	name := "include"
 
 	file := "file"
@@ -111,6 +118,9 @@ func TestWatchInclude(t *testing.T) {
 }
 
 func TestWatchRename(t *testing.T) {
+	if runtime.GOOS == "openbsd" {
+		t.Skip(failsOnOpenBSD)
+	}
 	name := "rename"
 
 	old := createTestFile(name, "oldfile")
@@ -123,7 +133,7 @@ func TestWatchRename(t *testing.T) {
 	destEvent := Event{new, Remove}
 	// Only on these platforms the removed file can be differentiated from
 	// the created file during renaming
-	if runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "solaris" {
+	if runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "solaris" || runtime.GOOS == "freebsd" {
 		destEvent = Event{new, NonRemove}
 	}
 	expectedEvents := []Event{
@@ -139,36 +149,99 @@ func TestWatchRename(t *testing.T) {
 	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{})
 }
 
-// TestWatchOutside checks that no changes from outside the folder make it in
-func TestWatchOutside(t *testing.T) {
+// TestWatchWinRoot checks that a watch at a drive letter does not panic due to
+// out of root event on every event.
+// https://github.com/syncthing/syncthing/issues/5695
+func TestWatchWinRoot(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows specific test")
+	}
+
 	outChan := make(chan Event)
 	backendChan := make(chan notify.EventInfo, backendBuffer)
+	errChan := make(chan error)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// testFs is Filesystem, but we need BasicFilesystem here
+	root := `D:\`
+	fs := newBasicFilesystem(root)
+	watch, roots, err := fs.watchPaths(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	defer func() {
+		cancel()
+		<-done
+	}()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Error(r)
+			}
+			cancel()
+		}()
+		fs.watchLoop(ctx, ".", roots, backendChan, outChan, errChan, fakeMatcher{})
+		close(done)
+	}()
+
+	// filepath.Dir as watch has a /... suffix
+	name := "foo"
+	backendChan <- fakeEventInfo(filepath.Join(filepath.Dir(watch), name))
+
+	select {
+	case <-time.After(10 * time.Second):
+		cancel()
+		t.Errorf("Timed out before receiving event")
+	case ev := <-outChan:
+		if ev.Name != name {
+			t.Errorf("Unexpected event %v, expected %v", ev.Name, name)
+		}
+	case err := <-errChan:
+		t.Error("Received fatal watch error:", err)
+	case <-ctx.Done():
+	}
+}
+
+// TestWatchOutside checks that no changes from outside the folder make it in
+func TestWatchOutside(t *testing.T) {
+	expectErrorForPath(t, filepath.Join(filepath.Dir(testDirAbs), "outside"))
+
+	rootWithoutSlash := strings.TrimRight(filepath.ToSlash(testDirAbs), "/")
+	expectErrorForPath(t, rootWithoutSlash+"outside")
+	expectErrorForPath(t, rootWithoutSlash+"outside/thing")
+}
+
+func expectErrorForPath(t *testing.T, path string) {
+	outChan := make(chan Event)
+	backendChan := make(chan notify.EventInfo, backendBuffer)
+	errChan := make(chan error)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// testFs is Filesystem, but we need BasicFilesystem here
 	fs := newBasicFilesystem(testDirAbs)
 
+	done := make(chan struct{})
 	go func() {
-		defer func() {
-			if recover() == nil {
-				select {
-				case <-ctx.Done(): // timed out
-				default:
-					t.Fatalf("Watch did not panic on receiving event outside of folder")
-				}
-			}
-			cancel()
-		}()
-		fs.watchLoop(".", testDirAbs, backendChan, outChan, fakeMatcher{}, ctx)
+		fs.watchLoop(ctx, ".", []string{testDirAbs}, backendChan, outChan, errChan, fakeMatcher{})
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
 	}()
 
-	backendChan <- fakeEventInfo(filepath.Join(filepath.Dir(testDirAbs), "outside"))
+	backendChan <- fakeEventInfo(path)
 
 	select {
 	case <-time.After(10 * time.Second):
-		cancel()
-		t.Errorf("Timed out before panicing")
+		t.Errorf("Timed out before receiving error")
+	case e := <-outChan:
+		t.Errorf("Unexpected passed through event %v", e)
+	case <-errChan:
 	case <-ctx.Done():
 	}
 }
@@ -176,6 +249,7 @@ func TestWatchOutside(t *testing.T) {
 func TestWatchSubpath(t *testing.T) {
 	outChan := make(chan Event)
 	backendChan := make(chan notify.EventInfo, backendBuffer)
+	errChan := make(chan error)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -183,7 +257,15 @@ func TestWatchSubpath(t *testing.T) {
 	fs := newBasicFilesystem(testDirAbs)
 
 	abs, _ := fs.rooted("sub")
-	go fs.watchLoop("sub", testDirAbs, backendChan, outChan, fakeMatcher{}, ctx)
+	done := make(chan struct{})
+	go func() {
+		fs.watchLoop(ctx, "sub", []string{testDirAbs}, backendChan, outChan, errChan, fakeMatcher{})
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
 
 	backendChan <- fakeEventInfo(filepath.Join(abs, "file"))
 
@@ -196,6 +278,8 @@ func TestWatchSubpath(t *testing.T) {
 		if ev.Name != filepath.Join("sub", "file") {
 			t.Errorf("While watching a subfolder, received an event with unexpected path %v", ev.Name)
 		}
+	case err := <-errChan:
+		t.Error("Received fatal watch error:", err)
 	}
 
 	cancel()
@@ -203,6 +287,9 @@ func TestWatchSubpath(t *testing.T) {
 
 // TestWatchOverflow checks that an event at the root is sent when maxFiles is reached
 func TestWatchOverflow(t *testing.T) {
+	if runtime.GOOS == "openbsd" {
+		t.Skip(failsOnOpenBSD)
+	}
 	name := "overflow"
 
 	expectedEvents := []Event{
@@ -277,7 +364,7 @@ func TestWatchSymlinkedRoot(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if _, err := linkedFs.Watch(".", fakeMatcher{}, ctx, false); err != nil {
+	if _, _, err := linkedFs.Watch(".", fakeMatcher{}, ctx, false); err != nil {
 		panic(err)
 	}
 
@@ -290,14 +377,10 @@ func TestWatchSymlinkedRoot(t *testing.T) {
 }
 
 func TestUnrootedChecked(t *testing.T) {
-	var unrooted string
-	defer func() {
-		if recover() == nil {
-			t.Fatal("unrootedChecked did not panic on outside path, but returned", unrooted)
-		}
-	}()
 	fs := newBasicFilesystem(testDirAbs)
-	unrooted = fs.unrootedChecked("/random/other/path", testDirAbs)
+	if unrooted, err := fs.unrootedChecked("/random/other/path", []string{testDirAbs}); err == nil {
+		t.Error("unrootedChecked did not return an error on outside path, but returned", unrooted)
+	}
 }
 
 func TestWatchIssue4877(t *testing.T) {
@@ -368,7 +451,7 @@ func testScenario(t *testing.T, name string, testCase func(), expectedEvents, al
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	eventChan, err := testFs.Watch(name, fm, ctx, false)
+	eventChan, errChan, err := testFs.Watch(name, fm, ctx, false)
 	if err != nil {
 		panic(err)
 	}
@@ -378,9 +461,10 @@ func testScenario(t *testing.T, name string, testCase func(), expectedEvents, al
 	testCase()
 
 	select {
-	case <-time.After(time.Minute):
-		t.Errorf("Timed out before receiving all expected events")
-
+	case <-time.After(10 * time.Second):
+		t.Error("Timed out before receiving all expected events")
+	case err := <-errChan:
+		t.Error("Received fatal watch error:", err)
 	case <-ctx.Done():
 	}
 }

@@ -6,14 +6,17 @@
 
 package util
 
-import "testing"
+import (
+	"testing"
+)
 
 type Defaulter struct {
 	Value string
 }
 
-func (Defaulter) ParseDefault(v string) (interface{}, error) {
-	return Defaulter{Value: v}, nil
+func (d *Defaulter) ParseDefault(v string) error {
+	*d = Defaulter{Value: v}
+	return nil
 }
 
 func TestSetDefaults(t *testing.T) {
@@ -37,9 +40,7 @@ func TestSetDefaults(t *testing.T) {
 		t.Errorf("defaulter failed")
 	}
 
-	if err := SetDefaults(x); err != nil {
-		t.Error(err)
-	}
+	SetDefaults(x)
 
 	if x.A != "string" {
 		t.Error("string failed")
@@ -76,17 +77,13 @@ func TestUniqueStrings(t *testing.T) {
 			nil,
 		},
 		{
-			[]string{"b", "a"},
-			[]string{"a", "b"},
-		},
-		{
 			[]string{"       a     ", "     a  ", "b        ", "    b"},
 			[]string{"a", "b"},
 		},
 	}
 
 	for _, test := range tests {
-		result := UniqueStrings(test.input)
+		result := UniqueTrimmedStrings(test.input)
 		if len(result) != len(test.expected) {
 			t.Errorf("%s != %s", result, test.expected)
 		}
@@ -225,5 +222,174 @@ func TestCopyMatching(t *testing.T) {
 	}
 	if to.NoCopy != 44 {
 		t.Error("NoCopy")
+	}
+}
+
+type mockedAddr struct {
+	network string
+	addr    string
+}
+
+func (a mockedAddr) Network() string {
+	return a.network
+}
+
+func (a mockedAddr) String() string {
+	return a.addr
+}
+
+func TestInspecifiedAddressLess(t *testing.T) {
+	cases := []struct {
+		netA  string
+		addrA string
+		netB  string
+		addrB string
+	}{
+		// B is assumed the winner.
+		{"tcp", "127.0.0.1:1234", "tcp", ":1235"},
+		{"tcp", "127.0.0.1:1234", "tcp", "0.0.0.0:1235"},
+		{"tcp4", "0.0.0.0:1234", "tcp", "0.0.0.0:1235"}, // tcp4 on the first one
+	}
+
+	for i, testCase := range cases {
+		addrs := []mockedAddr{
+			{testCase.netA, testCase.addrA},
+			{testCase.netB, testCase.addrB},
+		}
+
+		if AddressUnspecifiedLess(addrs[0], addrs[1]) {
+			t.Error(i, "unexpected")
+		}
+		if !AddressUnspecifiedLess(addrs[1], addrs[0]) {
+			t.Error(i, "unexpected")
+		}
+		if AddressUnspecifiedLess(addrs[0], addrs[0]) || AddressUnspecifiedLess(addrs[1], addrs[1]) {
+			t.Error(i, "unexpected")
+		}
+	}
+}
+
+func TestFillNil(t *testing.T) {
+	type A struct {
+		Slice []int
+		Map   map[string]string
+		Chan  chan int
+	}
+
+	type B struct {
+		Slice *[]int
+		Map   *map[string]string
+		Chan  *chan int
+	}
+
+	type C struct {
+		A A
+		B *B
+		D *****[]int
+	}
+
+	c := C{}
+	FillNil(&c)
+
+	if c.A.Slice == nil {
+		t.Error("c.A.Slice")
+	}
+	if c.A.Map == nil {
+		t.Error("c.A.Slice")
+	}
+	if c.A.Chan == nil {
+		t.Error("c.A.Chan")
+	}
+	if c.B == nil {
+		t.Error("c.B")
+	}
+	if c.B.Slice == nil {
+		t.Error("c.B.Slice")
+	}
+	if c.B.Map == nil {
+		t.Error("c.B.Slice")
+	}
+	if c.B.Chan == nil {
+		t.Error("c.B.Chan")
+	}
+	if *c.B.Slice == nil {
+		t.Error("*c.B.Slice")
+	}
+	if *c.B.Map == nil {
+		t.Error("*c.B.Slice")
+	}
+	if *c.B.Chan == nil {
+		t.Error("*c.B.Chan")
+	}
+	if *****c.D == nil {
+		t.Error("c.D")
+	}
+}
+
+func TestFillNilDoesNotBulldozeSetFields(t *testing.T) {
+	type A struct {
+		Slice []int
+		Map   map[string]string
+		Chan  chan int
+	}
+
+	type B struct {
+		Slice *[]int
+		Map   *map[string]string
+		Chan  *chan int
+	}
+
+	type C struct {
+		A A
+		B *B
+		D **[]int
+	}
+
+	ch := make(chan int, 10)
+	d := make([]int, 10)
+	dd := &d
+
+	c := C{
+		A: A{
+			Slice: []int{1},
+			Map: map[string]string{
+				"k": "v",
+			},
+			Chan: make(chan int, 10),
+		},
+		B: &B{
+			Slice: &[]int{1},
+			Map: &map[string]string{
+				"k": "v",
+			},
+			Chan: &ch,
+		},
+		D: &dd,
+	}
+	FillNil(&c)
+
+	if len(c.A.Slice) != 1 {
+		t.Error("c.A.Slice")
+	}
+	if len(c.A.Map) != 1 {
+		t.Error("c.A.Slice")
+	}
+	if cap(c.A.Chan) != 10 {
+		t.Error("c.A.Chan")
+	}
+	if c.B == nil {
+		t.Error("c.B")
+	}
+	if len(*c.B.Slice) != 1 {
+		t.Error("c.B.Slice")
+	}
+	if len(*c.B.Map) != 1 {
+		t.Error("c.B.Slice")
+	}
+	if cap(*c.B.Chan) != 10 {
+		t.Error("c.B.Chan")
+	}
+	if cap(**c.D) != 10 {
+		t.Error("c.D")
 	}
 }

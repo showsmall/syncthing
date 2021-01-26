@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -14,12 +15,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/build"
+	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/relay/protocol"
 	"github.com/syncthing/syncthing/lib/tlsutil"
@@ -32,24 +34,6 @@ import (
 
 	syncthingprotocol "github.com/syncthing/syncthing/lib/protocol"
 )
-
-var (
-	Version    string
-	BuildStamp string
-	BuildUser  string
-	BuildHost  string
-
-	BuildDate   time.Time
-	LongVersion string
-)
-
-func init() {
-	stamp, _ := strconv.Atoi(BuildStamp)
-	BuildDate = time.Unix(int64(stamp), 0)
-
-	date := BuildDate.UTC().Format("2006-01-02 15:04:05 MST")
-	LongVersion = fmt.Sprintf(`strelaysrv %s (%s %s-%s) %s@%s %s`, Version, runtime.Version(), runtime.GOOS, runtime.GOARCH, BuildUser, BuildHost, date)
-}
 
 var (
 	listen string
@@ -116,7 +100,14 @@ func main() {
 	flag.IntVar(&natTimeout, "nat-timeout", 10, "NAT discovery timeout in seconds")
 	flag.BoolVar(&pprofEnabled, "pprof", false, "Enable the built in profiling on the status server")
 	flag.IntVar(&networkBufferSize, "network-buffer", 2048, "Network buffer size (two of these per proxied connection)")
+	showVersion := flag.Bool("version", false, "Show version")
 	flag.Parse()
+
+	longVer := build.LongVersionFor("strelaysrv")
+	if *showVersion {
+		fmt.Println(longVer)
+		return
+	}
 
 	if extAddress == "" {
 		extAddress = listen
@@ -146,7 +137,7 @@ func main() {
 		}
 	}
 
-	log.Println(LongVersion)
+	log.Println(longVer)
 
 	maxDescriptors, err := osutil.MaximizeOpenFileLimit()
 	if maxDescriptors > 0 {
@@ -166,7 +157,7 @@ func main() {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		log.Println("Failed to load keypair. Generating one, this might take a while...")
-		cert, err = tlsutil.NewCertificate(certFile, keyFile, "strelaysrv")
+		cert, err = tlsutil.NewCertificate(certFile, keyFile, "strelaysrv", 20*365)
 		if err != nil {
 			log.Fatalln("Failed to generate X509 key pair:", err)
 		}
@@ -194,17 +185,19 @@ func main() {
 		log.Println("ID:", id)
 	}
 
-	wrapper := config.Wrap("config", config.New(id))
-	wrapper.SetOptions(config.OptionsConfiguration{
-		NATLeaseM:   natLease,
-		NATRenewalM: natRenewal,
-		NATTimeoutS: natTimeout,
+	wrapper := config.Wrap("config", config.New(id), id, events.NoopLogger)
+	wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.NATLeaseM = natLease
+		cfg.Options.NATRenewalM = natRenewal
+		cfg.Options.NATTimeoutS = natTimeout
 	})
 	natSvc := nat.NewService(id, wrapper)
 	mapping := mapping{natSvc.NewMapping(nat.TCP, addr.IP, addr.Port)}
 
 	if natEnabled {
-		go natSvc.Serve()
+		ctx, cancel := context.WithCancel(context.Background())
+		go natSvc.Serve(ctx)
+		defer cancel()
 		found := make(chan struct{})
 		mapping.OnChanged(func(_ *nat.Mapping, _, _ []nat.Address) {
 			select {
@@ -254,7 +247,7 @@ func main() {
 	for _, pool := range pools {
 		pool = strings.TrimSpace(pool)
 		if len(pool) > 0 {
-			go poolHandler(pool, uri, mapping)
+			go poolHandler(pool, uri, mapping, cert)
 		}
 	}
 

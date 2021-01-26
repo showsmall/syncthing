@@ -7,16 +7,22 @@
 package util
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
+type defaultParser interface {
+	ParseDefault(string) error
+}
+
 // SetDefaults sets default values on a struct, based on the default annotation.
-func SetDefaults(data interface{}) error {
+func SetDefaults(data interface{}) {
 	s := reflect.ValueOf(data).Elem()
 	t := s.Type()
 
@@ -26,32 +32,39 @@ func SetDefaults(data interface{}) error {
 
 		v := tag.Get("default")
 		if len(v) > 0 {
-			if parser, ok := f.Interface().(interface {
-				ParseDefault(string) (interface{}, error)
-			}); ok {
-				val, err := parser.ParseDefault(v)
-				if err != nil {
-					panic(err)
+			if f.CanInterface() {
+				if parser, ok := f.Interface().(defaultParser); ok {
+					if err := parser.ParseDefault(v); err != nil {
+						panic(err)
+					}
+					continue
 				}
-				f.Set(reflect.ValueOf(val))
-				continue
+			}
+
+			if f.CanAddr() && f.Addr().CanInterface() {
+				if parser, ok := f.Addr().Interface().(defaultParser); ok {
+					if err := parser.ParseDefault(v); err != nil {
+						panic(err)
+					}
+					continue
+				}
 			}
 
 			switch f.Interface().(type) {
 			case string:
 				f.SetString(v)
 
-			case int:
+			case int, uint32, int32, int64, uint64:
 				i, err := strconv.ParseInt(v, 10, 64)
 				if err != nil {
-					return err
+					panic(err)
 				}
 				f.SetInt(i)
 
-			case float64:
+			case float64, float32:
 				i, err := strconv.ParseFloat(v, 64)
 				if err != nil {
-					return err
+					panic(err)
 				}
 				f.SetFloat(i)
 
@@ -66,9 +79,12 @@ func SetDefaults(data interface{}) error {
 			default:
 				panic(f.Type())
 			}
+		} else if f.CanSet() && f.Kind() == reflect.Struct && f.CanAddr() {
+			if addr := f.Addr(); addr.CanInterface() {
+				SetDefaults(addr.Interface())
+			}
 		}
 	}
-	return nil
 }
 
 // CopyMatchingTag copies fields tagged tag:"value" from "from" struct onto "to" struct.
@@ -101,22 +117,77 @@ func CopyMatchingTag(from interface{}, to interface{}, tag string, shouldCopy fu
 	}
 }
 
-// UniqueStrings returns a list on unique strings, trimming and sorting them
-// at the same time.
-func UniqueStrings(ss []string) []string {
-	var m = make(map[string]bool, len(ss))
-	for _, s := range ss {
-		m[strings.Trim(s, " ")] = true
+// UniqueTrimmedStrings returns a list of all unique strings in ss,
+// in the order in which they first appear in ss, after trimming away
+// leading and trailing spaces.
+func UniqueTrimmedStrings(ss []string) []string {
+	var m = make(map[string]struct{}, len(ss))
+	var us = make([]string, 0, len(ss))
+	for _, v := range ss {
+		v = strings.Trim(v, " ")
+		if _, ok := m[v]; ok {
+			continue
+		}
+		m[v] = struct{}{}
+		us = append(us, v)
 	}
-
-	var us = make([]string, 0, len(m))
-	for k := range m {
-		us = append(us, k)
-	}
-
-	sort.Strings(us)
 
 	return us
+}
+
+func FillNilExceptDeprecated(data interface{}) {
+	fillNil(data, true)
+}
+
+func FillNil(data interface{}) {
+	fillNil(data, false)
+}
+
+func fillNil(data interface{}, skipDeprecated bool) {
+	s := reflect.ValueOf(data).Elem()
+	t := s.Type()
+	for i := 0; i < s.NumField(); i++ {
+		if skipDeprecated && strings.HasPrefix(t.Field(i).Name, "Deprecated") {
+			continue
+		}
+
+		f := s.Field(i)
+
+		for f.Kind() == reflect.Ptr && f.IsZero() && f.CanSet() {
+			newValue := reflect.New(f.Type().Elem())
+			f.Set(newValue)
+			f = f.Elem()
+		}
+
+		if f.CanSet() {
+			if f.IsZero() {
+				switch f.Kind() {
+				case reflect.Map:
+					f.Set(reflect.MakeMap(f.Type()))
+				case reflect.Slice:
+					f.Set(reflect.MakeSlice(f.Type(), 0, 0))
+				case reflect.Chan:
+					f.Set(reflect.MakeChan(f.Type(), 0))
+				}
+			}
+
+			switch f.Kind() {
+			case reflect.Slice:
+				if f.Type().Elem().Kind() != reflect.Struct {
+					continue
+				}
+				for i := 0; i < f.Len(); i++ {
+					fillNil(f.Index(i).Addr().Interface(), skipDeprecated)
+				}
+			case reflect.Struct:
+				if f.CanAddr() {
+					if addr := f.Addr(); addr.CanInterface() {
+						fillNil(addr.Interface(), skipDeprecated)
+					}
+				}
+			}
+		}
+	}
 }
 
 // FillNilSlices sets default value on slices that are still nil.
@@ -158,4 +229,76 @@ func Address(network, host string) string {
 		Host:   host,
 	}
 	return u.String()
+}
+
+// AddressUnspecifiedLess is a comparator function preferring least specific network address (most widely listening,
+// namely preferring 0.0.0.0 over some IP), if both IPs are equal, it prefers the less restrictive network (prefers tcp
+// over tcp4)
+func AddressUnspecifiedLess(a, b net.Addr) bool {
+	aIsUnspecified := false
+	bIsUnspecified := false
+	if host, _, err := net.SplitHostPort(a.String()); err == nil {
+		aIsUnspecified = host == "" || net.ParseIP(host).IsUnspecified()
+	}
+	if host, _, err := net.SplitHostPort(b.String()); err == nil {
+		bIsUnspecified = host == "" || net.ParseIP(host).IsUnspecified()
+	}
+
+	if aIsUnspecified == bIsUnspecified {
+		return len(a.Network()) < len(b.Network())
+	}
+	return aIsUnspecified
+}
+
+type ExitStatus int
+
+const (
+	ExitSuccess            ExitStatus = 0
+	ExitError              ExitStatus = 1
+	ExitNoUpgradeAvailable ExitStatus = 2
+	ExitRestart            ExitStatus = 3
+	ExitUpgrade            ExitStatus = 4
+)
+
+func (s ExitStatus) AsInt() int {
+	return int(s)
+}
+
+// OnDone calls fn when ctx is cancelled.
+func OnDone(ctx context.Context, fn func()) {
+	go func() {
+		<-ctx.Done()
+		fn()
+	}()
+}
+
+func CallWithContext(ctx context.Context, fn func() error) error {
+	var err error
+	done := make(chan struct{})
+	go func() {
+		err = fn()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func NiceDurationString(d time.Duration) string {
+	switch {
+	case d > 24*time.Hour:
+		d = d.Round(time.Hour)
+	case d > time.Hour:
+		d = d.Round(time.Minute)
+	case d > time.Minute:
+		d = d.Round(time.Second)
+	case d > time.Second:
+		d = d.Round(time.Millisecond)
+	case d > time.Millisecond:
+		d = d.Round(time.Microsecond)
+	}
+	return d.String()
 }

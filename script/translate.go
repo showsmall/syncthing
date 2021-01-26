@@ -21,20 +21,21 @@ import (
 
 var trans = make(map[string]string)
 var attrRe = regexp.MustCompile(`\{\{'([^']+)'\s+\|\s+translate\}\}`)
+var attrReCond = regexp.MustCompile(`\{\{.+\s+\?\s+'([^']+)'\s+:\s+'([^']+)'\s+\|\s+translate\}\}`)
 
 // exceptions to the untranslated text warning
 var noStringRe = regexp.MustCompile(
 	`^((\W*\{\{.*?\}\} ?.?\/?.?(bps)?\W*)+(\.stignore)?|[^a-zA-Z]+.?[^a-zA-Z]*|[kMGT]?B|Twitter|JS\W?|DEV|https?://\S+)$`)
 
 // exceptions to the untranslated text warning specific to aboutModalView.html
-var aboutRe = regexp.MustCompile(`^([^/]+/[^/]+|(The Go Pro|Font Awesome ).+)$`)
+var aboutRe = regexp.MustCompile(`^([^/]+/[^/]+|(The Go Pro|Font Awesome ).+|Build \{\{.+\}\}|Copyright .+ the Syncthing Authors\.)$`)
 
 func generalNode(n *html.Node, filename string) {
 	translate := false
 	if n.Type == html.ElementNode {
 		if n.Data == "translate" { // for <translate>Text</translate>
 			translate = true
-		} else if n.Data == "style" {
+		} else if n.Data == "style" || n.Data == "noscript" {
 			return
 		} else {
 			for _, a := range n.Attr {
@@ -46,8 +47,12 @@ func generalNode(n *html.Node, filename string) {
 					// copyright notices of other projects
 					return
 				} else {
-					if matches := attrRe.FindStringSubmatch(a.Val); len(matches) == 2 {
+					for _, matches := range attrRe.FindAllStringSubmatch(a.Val, -1) {
 						translation(matches[1])
+					}
+					for _, matches := range attrReCond.FindAllStringSubmatch(a.Val, -1) {
+						translation(matches[1])
+						translation(matches[2])
 					}
 					if a.Key == "data-content" &&
 						!noStringRe.MatchString(a.Val) {

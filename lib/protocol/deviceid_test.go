@@ -1,6 +1,6 @@
 // Copyright (C) 2014 The Protocol Authors.
 
-//go:generate go run ../../script/protofmt.go deviceid_test.proto
+//go:generate go run ../../proto/scripts/protofmt.go deviceid_test.proto
 //go:generate protoc -I ../../ -I . --gogofast_out=. deviceid_test.proto
 
 package protocol
@@ -64,9 +64,13 @@ func TestMarshallingDeviceID(t *testing.T) {
 	n2 := DeviceID{}
 
 	bs, _ := n0.MarshalText()
-	n1.UnmarshalText(bs)
+	if err := n1.UnmarshalText(bs); err != nil {
+		t.Fatal(err)
+	}
 	bs, _ = n1.MarshalText()
-	n2.UnmarshalText(bs)
+	if err := n2.UnmarshalText(bs); err != nil {
+		t.Fatal(err)
+	}
 
 	if n2.String() != n0.String() {
 		t.Errorf("String marshalling error; %q != %q", n2.String(), n0.String())
@@ -95,8 +99,10 @@ func TestShortIDString(t *testing.T) {
 
 func TestDeviceIDFromBytes(t *testing.T) {
 	id0, _ := DeviceIDFromString(formatted)
-	id1 := DeviceIDFromBytes(id0[:])
-	if id1.String() != formatted {
+	id1, err := DeviceIDFromBytes(id0[:])
+	if err != nil {
+		t.Fatal(err)
+	} else if id1.String() != formatted {
 		t.Errorf("Wrong device ID, got %q, want %q", id1, formatted)
 	}
 }
@@ -146,7 +152,10 @@ func TestNewDeviceIDMarshalling(t *testing.T) {
 
 	// Verify it's the same
 
-	if DeviceIDFromBytes(msg2.Test) != id0 {
+	id1, err := DeviceIDFromBytes(msg2.Test)
+	if err != nil {
+		t.Fatal(err)
+	} else if id1 != id0 {
 		t.Error("Mismatch in old -> new direction")
 	}
 }

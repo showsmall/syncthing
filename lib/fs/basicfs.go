@@ -8,27 +8,46 @@ package fs
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
-	"github.com/calmh/du"
+	"github.com/shirou/gopsutil/v3/disk"
 )
 
 var (
-	ErrInvalidFilename = errors.New("filename is invalid")
-	ErrNotRelative     = errors.New("not a relative path")
+	errInvalidFilenameEmpty               = errors.New("name is invalid, must not be empty")
+	errInvalidFilenameWindowsSpacePeriod  = errors.New("name is invalid, must not end in space or period on Windows")
+	errInvalidFilenameWindowsReservedName = errors.New("name is invalid, contains Windows reserved name (NUL, COM1, etc.)")
+	errInvalidFilenameWindowsReservedChar = errors.New("name is invalid, contains Windows reserved character (?, *, etc.)")
+	errNotRelative                        = errors.New("not a relative path")
 )
+
+func WithJunctionsAsDirs() Option {
+	return func(fs Filesystem) {
+		if basic, ok := fs.(*BasicFilesystem); !ok {
+			l.Warnln("WithJunctionsAsDirs must only be used with FilesystemTypeBasic")
+		} else {
+			basic.junctionsAsDirs = true
+		}
+	}
+}
 
 // The BasicFilesystem implements all aspects by delegating to package os.
 // All paths are relative to the root and cannot (should not) escape the root directory.
 type BasicFilesystem struct {
-	root string
+	root            string
+	junctionsAsDirs bool
 }
 
-func newBasicFilesystem(root string) *BasicFilesystem {
+func newBasicFilesystem(root string, opts ...Option) *BasicFilesystem {
+	if root == "" {
+		root = "." // Otherwise "" becomes "/" below
+	}
+
 	// The reason it's done like this:
 	// C:          ->  C:\            ->  C:\        (issue that this is trying to fix)
 	// C:\somedir  ->  C:\somedir\    ->  C:\somedir
@@ -59,7 +78,13 @@ func newBasicFilesystem(root string) *BasicFilesystem {
 		root = longFilenameSupport(root)
 	}
 
-	return &BasicFilesystem{root}
+	fs := &BasicFilesystem{
+		root: root,
+	}
+	for _, opt := range opts {
+		opt(fs)
+	}
+	return fs
 }
 
 // rooted expands the relative path to the full path that is then used with os
@@ -73,7 +98,7 @@ func (f *BasicFilesystem) rooted(rel string) (string, error) {
 func rooted(rel, root string) (string, error) {
 	// The root must not be empty.
 	if root == "" {
-		return "", ErrInvalidFilename
+		return "", errInvalidFilenameEmpty
 	}
 
 	var err error
@@ -96,6 +121,14 @@ func (f *BasicFilesystem) Chmod(name string, mode FileMode) error {
 		return err
 	}
 	return os.Chmod(name, os.FileMode(mode))
+}
+
+func (f *BasicFilesystem) Lchown(name string, uid, gid int) error {
+	name, err := f.rooted(name)
+	if err != nil {
+		return err
+	}
+	return os.Lchown(name, uid, gid)
 }
 
 func (f *BasicFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
@@ -132,11 +165,11 @@ func (f *BasicFilesystem) Lstat(name string) (FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	fi, err := underlyingLstat(name)
+	fi, err := f.underlyingLstat(name)
 	if err != nil {
 		return nil, err
 	}
-	return fsFileInfo{fi}, err
+	return basicFileInfo{fi}, err
 }
 
 func (f *BasicFilesystem) Remove(name string) error {
@@ -176,7 +209,7 @@ func (f *BasicFilesystem) Stat(name string) (FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fsFileInfo{fi}, err
+	return basicFileInfo{fi}, err
 }
 
 func (f *BasicFilesystem) DirNames(name string) ([]string, error) {
@@ -207,7 +240,7 @@ func (f *BasicFilesystem) Open(name string) (File, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fsFile{fd, name}, err
+	return basicFile{fd, name}, err
 }
 
 func (f *BasicFilesystem) OpenFile(name string, flags int, mode FileMode) (File, error) {
@@ -219,7 +252,7 @@ func (f *BasicFilesystem) OpenFile(name string, flags int, mode FileMode) (File,
 	if err != nil {
 		return nil, err
 	}
-	return fsFile{fd, name}, err
+	return basicFile{fd, name}, err
 }
 
 func (f *BasicFilesystem) Create(name string) (File, error) {
@@ -231,7 +264,7 @@ func (f *BasicFilesystem) Create(name string) (File, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fsFile{fd, name}, err
+	return basicFile{fd, name}, err
 }
 
 func (f *BasicFilesystem) Walk(root string, walkFn WalkFunc) error {
@@ -257,11 +290,14 @@ func (f *BasicFilesystem) Usage(name string) (Usage, error) {
 	if err != nil {
 		return Usage{}, err
 	}
-	u, err := du.Get(name)
+	u, err := disk.Usage(name)
+	if err != nil {
+		return Usage{}, err
+	}
 	return Usage{
-		Free:  u.FreeBytes,
-		Total: u.TotalBytes,
-	}, err
+		Free:  u.Free,
+		Total: u.Total,
+	}, nil
 }
 
 func (f *BasicFilesystem) Type() FilesystemType {
@@ -275,45 +311,45 @@ func (f *BasicFilesystem) URI() string {
 func (f *BasicFilesystem) SameFile(fi1, fi2 FileInfo) bool {
 	// Like os.SameFile, we always return false unless fi1 and fi2 were created
 	// by this package's Stat/Lstat method.
-	f1, ok1 := fi1.(fsFileInfo)
-	f2, ok2 := fi2.(fsFileInfo)
+	f1, ok1 := fi1.(basicFileInfo)
+	f2, ok2 := fi2.(basicFileInfo)
 	if !ok1 || !ok2 {
 		return false
 	}
 
-	return os.SameFile(f1.FileInfo, f2.FileInfo)
+	return os.SameFile(f1.osFileInfo(), f2.osFileInfo())
 }
 
-// fsFile implements the fs.File interface on top of an os.File
-type fsFile struct {
+// basicFile implements the fs.File interface on top of an os.File
+type basicFile struct {
 	*os.File
 	name string
 }
 
-func (f fsFile) Name() string {
+func (f basicFile) Name() string {
 	return f.name
 }
 
-func (f fsFile) Stat() (FileInfo, error) {
+func (f basicFile) Stat() (FileInfo, error) {
 	info, err := f.File.Stat()
 	if err != nil {
 		return nil, err
 	}
-	return fsFileInfo{info}, nil
+	return basicFileInfo{info}, nil
 }
 
-// fsFileInfo implements the fs.FileInfo interface on top of an os.FileInfo.
-type fsFileInfo struct {
+// basicFileInfo implements the fs.FileInfo interface on top of an os.FileInfo.
+type basicFileInfo struct {
 	os.FileInfo
 }
 
-func (e fsFileInfo) IsSymlink() bool {
-	// Must use fsFileInfo.Mode() because it may apply magic.
+func (e basicFileInfo) IsSymlink() bool {
+	// Must use basicFileInfo.Mode() because it may apply magic.
 	return e.Mode()&ModeSymlink != 0
 }
 
-func (e fsFileInfo) IsRegular() bool {
-	// Must use fsFileInfo.Mode() because it may apply magic.
+func (e basicFileInfo) IsRegular() bool {
+	// Must use basicFileInfo.Mode() because it may apply magic.
 	return e.Mode()&ModeType == 0
 }
 
@@ -325,4 +361,14 @@ func longFilenameSupport(path string) string {
 		return `\\?\` + path
 	}
 	return path
+}
+
+type ErrWatchEventOutsideRoot struct{ msg string }
+
+func (e *ErrWatchEventOutsideRoot) Error() string {
+	return e.msg
+}
+
+func (f *BasicFilesystem) newErrWatchEventOutsideRoot(absPath string, roots []string) *ErrWatchEventOutsideRoot {
+	return &ErrWatchEventOutsideRoot{fmt.Sprintf("Watching for changes encountered an event outside of the filesystem root: f.root==%v, roots==%v, path==%v. This should never happen, please report this message to forum.syncthing.net.", f.root, roots, absPath)}
 }

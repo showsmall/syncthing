@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/syncthing/syncthing/lib/rand"
 )
 
 func setup(t *testing.T) (*BasicFilesystem, string) {
@@ -56,6 +58,54 @@ func TestChmodFile(t *testing.T) {
 	}
 }
 
+func TestChownFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Not supported on Windows")
+		return
+	}
+	if os.Getuid() != 0 {
+		// We are not root. No expectation of being able to chown. Our tests
+		// typically don't run with CAP_FOWNER.
+		t.Skip("Test not possible")
+		return
+	}
+
+	fs, dir := setup(t)
+	path := filepath.Join(dir, "file")
+	defer os.RemoveAll(dir)
+
+	defer os.Chmod(path, 0666)
+
+	fd, err := os.Create(path)
+	if err != nil {
+		t.Error("Unexpected error:", err)
+	}
+	fd.Close()
+
+	_, err = fs.Lstat("file")
+	if err != nil {
+		t.Error("Unexpected error:", err)
+	}
+
+	newUID := 1000 + rand.Intn(30000)
+	newGID := 1000 + rand.Intn(30000)
+
+	if err := fs.Lchown("file", newUID, newGID); err != nil {
+		t.Error("Unexpected error:", err)
+	}
+
+	info, err := fs.Lstat("file")
+	if err != nil {
+		t.Error("Unexpected error:", err)
+	}
+	if info.Owner() != newUID {
+		t.Errorf("Incorrect owner, expected %d but got %d", newUID, info.Owner())
+	}
+	if info.Group() != newGID {
+		t.Errorf("Incorrect group, expected %d but got %d", newGID, info.Group())
+	}
+}
+
 func TestChmodDir(t *testing.T) {
 	fs, dir := setup(t)
 	path := filepath.Join(dir, "dir")
@@ -69,6 +119,10 @@ func TestChmodDir(t *testing.T) {
 	defer os.Chmod(path, mode)
 
 	if err := os.Mkdir(path, mode); err != nil {
+		t.Error(err)
+	}
+	// On UNIX, Mkdir will subtract the umask, so force desired mode explicitly
+	if err := os.Chmod(path, mode); err != nil {
 		t.Error(err)
 	}
 
@@ -464,6 +518,10 @@ func TestNewBasicFilesystem(t *testing.T) {
 		t.Skip("non-windows root paths")
 	}
 
+	currentDir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
 	testCases := []struct {
 		input        string
 		expectedRoot string
@@ -471,7 +529,8 @@ func TestNewBasicFilesystem(t *testing.T) {
 	}{
 		{"/foo/bar/baz", "/foo/bar/baz", "/foo/bar/baz"},
 		{"/foo/bar/baz/", "/foo/bar/baz", "/foo/bar/baz"},
-		{"", "/", "/"},
+		{"", currentDir, currentDir},
+		{".", currentDir, currentDir},
 		{"/", "/", "/"},
 	}
 
@@ -515,4 +574,22 @@ func TestRel(t *testing.T) {
 			t.Errorf(`rel("%v", "%v") == "%v", expected "%v"`, tc.abs, tc.root, res, tc.expectedRel)
 		}
 	}
+}
+
+func TestBasicWalkSkipSymlink(t *testing.T) {
+	_, dir := setup(t)
+	defer os.RemoveAll(dir)
+	testWalkSkipSymlink(t, FilesystemTypeBasic, dir)
+}
+
+func TestWalkTraverseDirJunct(t *testing.T) {
+	_, dir := setup(t)
+	defer os.RemoveAll(dir)
+	testWalkTraverseDirJunct(t, FilesystemTypeBasic, dir)
+}
+
+func TestWalkInfiniteRecursion(t *testing.T) {
+	_, dir := setup(t)
+	defer os.RemoveAll(dir)
+	testWalkInfiniteRecursion(t, FilesystemTypeBasic, dir)
 }

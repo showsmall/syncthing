@@ -12,7 +12,7 @@ import (
 
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/db"
-	"github.com/syncthing/syncthing/lib/fs"
+	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/ignore"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/versioner"
@@ -56,34 +56,37 @@ type receiveOnlyFolder struct {
 	*sendReceiveFolder
 }
 
-func newReceiveOnlyFolder(model *Model, cfg config.FolderConfiguration, ver versioner.Versioner, fs fs.Filesystem) service {
-	sr := newSendReceiveFolder(model, cfg, ver, fs).(*sendReceiveFolder)
+func newReceiveOnlyFolder(model *model, fset *db.FileSet, ignores *ignore.Matcher, cfg config.FolderConfiguration, ver versioner.Versioner, evLogger events.Logger, ioLimiter *byteSemaphore) service {
+	sr := newSendReceiveFolder(model, fset, ignores, cfg, ver, evLogger, ioLimiter).(*sendReceiveFolder)
 	sr.localFlags = protocol.FlagLocalReceiveOnly // gets propagated to the scanner, and set on locally changed files
 	return &receiveOnlyFolder{sr}
 }
 
-func (f *receiveOnlyFolder) Revert(fs *db.FileSet, updateFn func([]protocol.FileInfo)) {
+func (f *receiveOnlyFolder) Revert() {
+	f.doInSync(func() error { f.revert(); return nil })
+}
+
+func (f *receiveOnlyFolder) revert() {
+	l.Infof("Reverting folder %v", f.Description)
+
 	f.setState(FolderScanning)
 	defer f.setState(FolderIdle)
-
-	// XXX: This *really* should be given to us in the constructor...
-	f.model.fmut.RLock()
-	ignores := f.model.folderIgnores[f.folderID]
-	f.model.fmut.RUnlock()
 
 	scanChan := make(chan string)
 	go f.pullScannerRoutine(scanChan)
 	defer close(scanChan)
 
 	delQueue := &deleteQueue{
-		handler:  f, // for the deleteFile and deleteDir methods
-		ignores:  ignores,
+		handler:  f, // for the deleteItemOnDisk and deleteDirOnDisk methods
+		ignores:  f.ignores,
 		scanChan: scanChan,
 	}
 
 	batch := make([]protocol.FileInfo, 0, maxBatchSizeFiles)
 	batchSizeBytes := 0
-	fs.WithHave(protocol.LocalDeviceID, func(intf db.FileIntf) bool {
+	snap := f.fset.Snapshot()
+	defer snap.Release()
+	snap.WithHave(protocol.LocalDeviceID, func(intf protocol.FileIntf) bool {
 		fi := intf.(protocol.FileInfo)
 		if !fi.IsReceiveOnlyChanged() {
 			// We're only interested in files that have changed locally in
@@ -91,13 +94,14 @@ func (f *receiveOnlyFolder) Revert(fs *db.FileSet, updateFn func([]protocol.File
 			return true
 		}
 
+		fi.LocalFlags &^= protocol.FlagLocalReceiveOnly
 		if len(fi.Version.Counters) == 1 && fi.Version.Counters[0].ID == f.shortID {
 			// We are the only device mentioned in the version vector so the
 			// file must originate here. A revert then means to delete it.
 			// We'll delete files directly, directories get queued and
 			// handled below.
 
-			handled, err := delQueue.handle(fi)
+			handled, err := delQueue.handle(fi, snap)
 			if err != nil {
 				l.Infof("Revert: deleting %s: %v\n", fi.Name, err)
 				return true // continue
@@ -106,15 +110,8 @@ func (f *receiveOnlyFolder) Revert(fs *db.FileSet, updateFn func([]protocol.File
 				return true // continue
 			}
 
-			fi = protocol.FileInfo{
-				Name:       fi.Name,
-				Type:       fi.Type,
-				ModifiedS:  fi.ModifiedS,
-				ModifiedNs: fi.ModifiedNs,
-				ModifiedBy: f.shortID,
-				Deleted:    true,
-				Version:    protocol.Vector{}, // if this file ever resurfaces anywhere we want our delete to be strictly older
-			}
+			fi.SetDeleted(f.shortID)
+			fi.Version = protocol.Vector{} // if this file ever resurfaces anywhere we want our delete to be strictly older
 		} else {
 			// Revert means to throw away our local changes. We reset the
 			// version to the empty vector, which is strictly older than any
@@ -122,27 +119,26 @@ func (f *receiveOnlyFolder) Revert(fs *db.FileSet, updateFn func([]protocol.File
 			// either, so we will not create a conflict copy of our local
 			// changes.
 			fi.Version = protocol.Vector{}
-			fi.LocalFlags &^= protocol.FlagLocalReceiveOnly
 		}
 
 		batch = append(batch, fi)
 		batchSizeBytes += fi.ProtoSize()
 
 		if len(batch) >= maxBatchSizeFiles || batchSizeBytes >= maxBatchSizeBytes {
-			updateFn(batch)
+			f.updateLocalsFromScanning(batch)
 			batch = batch[:0]
 			batchSizeBytes = 0
 		}
 		return true
 	})
 	if len(batch) > 0 {
-		updateFn(batch)
+		f.updateLocalsFromScanning(batch)
 	}
 	batch = batch[:0]
 	batchSizeBytes = 0
 
 	// Handle any queued directories
-	deleted, err := delQueue.flush()
+	deleted, err := delQueue.flush(snap)
 	if err != nil {
 		l.Infoln("Revert:", err)
 	}
@@ -158,7 +154,7 @@ func (f *receiveOnlyFolder) Revert(fs *db.FileSet, updateFn func([]protocol.File
 		})
 	}
 	if len(batch) > 0 {
-		updateFn(batch)
+		f.updateLocalsFromScanning(batch)
 	}
 
 	// We will likely have changed our local index, but that won't trigger a
@@ -171,15 +167,15 @@ func (f *receiveOnlyFolder) Revert(fs *db.FileSet, updateFn func([]protocol.File
 // directories for last.
 type deleteQueue struct {
 	handler interface {
-		deleteFile(file protocol.FileInfo, scanChan chan<- string) (dbUpdateJob, error)
-		deleteDir(dir string, ignores *ignore.Matcher, scanChan chan<- string) error
+		deleteItemOnDisk(item protocol.FileInfo, snap *db.Snapshot, scanChan chan<- string) error
+		deleteDirOnDisk(dir string, snap *db.Snapshot, scanChan chan<- string) error
 	}
 	ignores  *ignore.Matcher
 	dirs     []string
 	scanChan chan<- string
 }
 
-func (q *deleteQueue) handle(fi protocol.FileInfo) (bool, error) {
+func (q *deleteQueue) handle(fi protocol.FileInfo, snap *db.Snapshot) (bool, error) {
 	// Things that are ignored but not marked deletable are not processed.
 	ign := q.ignores.Match(fi.Name)
 	if ign.IsIgnored() && !ign.IsDeletable() {
@@ -193,11 +189,11 @@ func (q *deleteQueue) handle(fi protocol.FileInfo) (bool, error) {
 	}
 
 	// Kill it.
-	_, err := q.handler.deleteFile(fi, q.scanChan)
+	err := q.handler.deleteItemOnDisk(fi, snap, q.scanChan)
 	return true, err
 }
 
-func (q *deleteQueue) flush() ([]string, error) {
+func (q *deleteQueue) flush(snap *db.Snapshot) ([]string, error) {
 	// Process directories from the leaves inward.
 	sort.Sort(sort.Reverse(sort.StringSlice(q.dirs)))
 
@@ -205,7 +201,7 @@ func (q *deleteQueue) flush() ([]string, error) {
 	var deleted []string
 
 	for _, dir := range q.dirs {
-		if err := q.handler.deleteDir(dir, q.ignores, q.scanChan); err == nil {
+		if err := q.handler.deleteDirOnDisk(dir, snap, q.scanChan); err == nil {
 			deleted = append(deleted, dir)
 		} else if err != nil && firstError == nil {
 			firstError = err
